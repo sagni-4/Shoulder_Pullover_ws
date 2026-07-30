@@ -48,7 +48,7 @@
   <arg name="centerline_bin_source" default="mask_ipm" description="'mask_ipm' (default): dense per-image-row mask-boundary midpoint via ground-plane IPM, robust on a narrow shoulder. 'lidar': sparse LiDAR points projected into the mask -- set to 'lidar' to instantly revert (no rebuild) if mask_ipm regresses"/>
   <arg name="centerline_estimator" default="extent_midpoint" description="'extent_midpoint' (default) centers on the midpoint of the shoulder's left/right edge, the standard lane-centerline technique; 'median' is the old density-weighted centroid that was biased toward whichever edge got more samples -- set to 'median' to instantly revert (no rebuild)"/>
   <arg name="centerline_edge_trim_fraction" default="0.1"/>
-  <arg name="centerline_enable_outlier_rejection" default="true" description="Reject bins that disagree with a robust trend through the frame's valid bins (fixes a hook/reversal on a sparse bin run) -- set to false to instantly revert (no rebuild)"/>
+  <arg name="centerline_enable_outlier_rejection" default="true" description="Reject bins that disagree with a robust trend through the frame's valid bins -- only affects the accumulated path, not the local path -- set to false to instantly revert (no rebuild)"/>
   <arg name="centerline_outlier_rejection_threshold" default="0.5"/>
   <arg name="centerline_waypoint_spacing" default="1.0"/>
   <arg name="centerline_smoothing_alpha" default="0.3"/>

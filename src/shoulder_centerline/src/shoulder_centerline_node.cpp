@@ -27,17 +27,22 @@
 //   2. Bin by forward distance, take a lateral center per bin
 //      (centerline_estimator: extent-midpoint of the samples, or median),
 //      density-gated.
-//   3. Reject bins that disagree with a robust (Theil-Sen) linear trend
-//      through this frame's valid bins by more than
-//      outlier_rejection_threshold -- with only a handful of valid bins (a
-//      sparsely-detected stretch), a cubic spline has no averaging effect
-//      and will faithfully follow a single noisy bin instead of smoothing
-//      over it. Rejected bins are excluded from *both* the local fit below
-//      and the world-frame accumulation, so a bad bin can't leak into either
-//      published line.
-//   4. Fit a natural cubic spline (uniform-knot parametrization over the
-//      accepted bin sequence -- see cubic_spline.hpp) through the bin
-//      centroids, resample at fixed arclength spacing for waypoints with
+//   3. Separately, reject bins that disagree with a robust (Theil-Sen)
+//      linear trend through this frame's valid bins by more than
+//      outlier_rejection_threshold, but only to decide which bins' raw
+//      samples are allowed into the world-frame accumulation (step 4b) --
+//      deliberately NOT applied to the local fit in step 4a. With only a
+//      handful of valid bins (a sparsely-detected stretch), Theil-Sen itself
+//      is fragile (a small outlier minority is already near its statistical
+//      breakdown point with so few points), so filtering the local fit's
+//      input too caused its own regression (a short, wrongly-trimmed local
+//      path) rather than helping. The accumulated trail is worth protecting
+//      from a single bad frame regardless (it's far harder to walk back
+//      once baked in over many frames); the local fit is re-derived fresh
+//      every frame anyway, so an occasional bad frame there is self-healing.
+//   4a. Fit a natural cubic spline (uniform-knot parametrization over ALL
+//      this frame's valid bins -- see cubic_spline.hpp), resample at fixed
+//      arclength spacing for waypoints with
 //      heading (first derivative) and signed curvature
 //      kappa = (x'y'' - y'x'') / (x'^2+y'^2)^1.5 (standard Frenet-frame form).
 //   5. Light exponential moving average per arclength step, frame to frame.
@@ -548,36 +553,34 @@ private:
     }
 
     // Reject bins that disagree with a robust trend through this frame's
-    // valid bins (see theilSenFit()'s comment) -- a rejected bin is excluded
-    // from both the local fit below and the world-bin accumulation, since
-    // both would otherwise inherit the same bad sample.
+    // valid bins (see theilSenFit()'s comment) -- used ONLY to gate what
+    // enters the world-bin accumulation below, deliberately NOT to filter
+    // the local fit's input. The local path already looked fine before this
+    // was added, and with only a handful of bins per frame here, Theil-Sen
+    // itself is fragile (a 2-of-5 "outlier" minority is already close to its
+    // statistical breakdown point) -- applying it to the local fit too was a
+    // regression: it could trim down to a short, wrongly-selected subset
+    // instead of just protecting the (much harder to undo) accumulated
+    // trail from a single bad frame's bin.
     std::vector<bool> bin_accepted(num_bins, false);
     for (const int b : valid_bin_idx) {
       bin_accepted[b] = true;
     }
-    std::vector<double> fit_cx = cx_list, fit_cy = cy_list, fit_cz = cz_list;
     int rejected_bins = 0;
     if (enable_outlier_rejection_ && cx_list.size() >= 3) {
       const auto [slope, intercept] = theilSenFit(cx_list, cy_list);
-      fit_cx.clear();
-      fit_cy.clear();
-      fit_cz.clear();
       for (std::size_t i = 0; i < cx_list.size(); ++i) {
         const double predicted = slope * cx_list[i] + intercept;
         if (std::abs(cy_list[i] - predicted) > outlier_rejection_threshold_) {
           bin_accepted[valid_bin_idx[i]] = false;
           ++rejected_bins;
-          continue;
         }
-        fit_cx.push_back(cx_list[i]);
-        fit_cy.push_back(cy_list[i]);
-        fit_cz.push_back(cz_list[i]);
       }
     }
 
     std::vector<Waypoint> waypoints;
-    if (static_cast<int>(fit_cx.size()) >= min_valid_bins_) {
-      waypoints = fitCenterline(fit_cx, fit_cy, fit_cz);
+    if (valid_bins >= min_valid_bins_) {
+      waypoints = fitCenterline(cx_list, cy_list, cz_list);
     }
 
     if (!waypoints.empty()) {
