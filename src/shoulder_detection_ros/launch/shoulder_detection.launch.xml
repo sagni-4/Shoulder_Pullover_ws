@@ -52,6 +52,7 @@
   <arg name="centerline_smoothing_alpha" default="0.3"/>
   <arg name="centerline_accumulate_path" default="true" description="Also publish a growing map-frame Path (~/shoulder_centerline_path_map), built from world-frame LiDAR-sample bins (median of every sample ever observed per bin), in addition to the local ego-relative window"/>
   <arg name="centerline_min_world_bin_samples" default="20" description="Raise if the accumulated trail still looks jittery -- trades a longer lag behind the vehicle for a smoother median (each real-world segment is typically sampled 50-100+ times before the vehicle passes it)"/>
+  <arg name="centerline_world_bin_far_margin" default="2" description="Excludes the farthest N valid bins each frame from the accumulated path only (never the local path) -- fixes a persistent kink at a fixed distance ahead of the vehicle. Set to 0 to disable (no rebuild)"/>
 
   <!-- RViz -->
   <arg name="rviz" default="false" description="Launch a standalone RViz with this package's Image displays"/>
@@ -107,6 +108,7 @@
     <arg name="smoothing_alpha" value="$(var centerline_smoothing_alpha)"/>
     <arg name="accumulate_path" value="$(var centerline_accumulate_path)"/>
     <arg name="min_world_bin_samples" value="$(var centerline_min_world_bin_samples)"/>
+    <arg name="world_bin_far_margin" value="$(var centerline_world_bin_far_margin)"/>
   </include>
 
   <node pkg="rviz2" exec="rviz2" name="shoulder_detection_rviz" output="screen"
