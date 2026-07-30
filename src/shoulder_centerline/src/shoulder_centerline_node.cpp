@@ -11,11 +11,22 @@
 // already static-broadcast by the carla_sensor_kit URDF.
 //
 // Pipeline per synchronized (image, mask, lidar) frame:
-//   1. Project LiDAR points into the mask's pixel frame, keep the ones
-//      landing on the shoulder class.
-//   2. Transform those points into `output_frame` (base_link), drop any
-//      outside a ground-height band.
-//   3. Bin by forward distance, median lateral offset per bin, density-gated.
+//   1. Get a lateral sample per forward-distance bin, from one of two
+//      sources (bin_source param):
+//      - "mask_ipm" (default): per sampled image row, find the largest
+//        contiguous run of shoulder-classified columns, take its midpoint,
+//        and back-project that pixel to base_link via ground-plane (z=0)
+//        inverse perspective mapping. Dense/robust regardless of how narrow
+//        the real shoulder is; assumes locally flat ground.
+//      - "lidar": project LiDAR points into the mask's pixel frame, keep the
+//        ones landing on the shoulder class, transform into base_link and
+//        drop any outside a ground-height band. Sparse -- only a handful of
+//        rays land on a narrow shoulder per frame, which was the actual
+//        source of jitter/off-centering in earlier iterations, not the
+//        per-bin aggregation method.
+//   2. Bin by forward distance, take a lateral center per bin
+//      (centerline_estimator: extent-midpoint of the samples, or median),
+//      density-gated.
 //   4. Fit a natural cubic spline (uniform-knot parametrization over the
 //      valid bin sequence -- see cubic_spline.hpp) through the bin
 //      centroids, resample at fixed arclength spacing for waypoints with
@@ -163,6 +174,29 @@ public:
     use_extent_midpoint_ = (centerline_estimator_ == "extent_midpoint");
     edge_trim_fraction_ = declare_parameter<double>("edge_trim_fraction", 0.1);
 
+    // Where the lateral sample for each bin comes from in the first place.
+    // "lidar": project LiDAR points into the mask, keep the ones landing on
+    // the shoulder class -- fine on a wide shoulder, but on a narrow one
+    // (e.g. a mountain-pass section with only ~1-1.5m of paved shoulder
+    // before a guardrail) only a handful of sparse LiDAR rays land inside it
+    // per frame, so *any* point-based estimate (median or extent-midpoint)
+    // is working with too few, noisy samples -- that's what caused the
+    // zigzag even after the extent-midpoint fix, not the aggregation method.
+    // "mask_ipm" (default) instead works in the dense 2D mask: for each
+    // sampled image row, find the *largest contiguous run* of shoulder-
+    // classified columns (robust to disjoint noise elsewhere in the row),
+    // take its midpoint column, and back-project that single pixel to 3D via
+    // classical ground-plane inverse perspective mapping (ray-cast the pixel
+    // through the known static camera pose, intersect the base_link z=0
+    // plane) -- the same principle used by monocular lane-centering ADAS
+    // systems. This has far higher effective resolution than sparse LiDAR
+    // hits regardless of how narrow the real shoulder is, at the cost of
+    // assuming locally flat ground (true for this project's documented flat
+    // CARLA test routes). Set back to "lidar" (no rebuild) to revert.
+    use_mask_center_ipm_ = declare_parameter<std::string>("bin_source", "mask_ipm") == "mask_ipm";
+    mask_row_step_ = declare_parameter<int>("mask_row_step", 4);
+    min_mask_run_px_ = declare_parameter<int>("min_mask_run_px", 3);
+
     waypoint_spacing_ = declare_parameter<double>("waypoint_spacing", 1.0);
     smoothing_alpha_ = declare_parameter<double>("smoothing_alpha", 0.3);
 
@@ -252,6 +286,61 @@ private:
   double lateralCenter(const std::vector<double> & y) const
   {
     return use_extent_midpoint_ ? robustExtentMidpoint(y, edge_trim_fraction_) : median(y);
+  }
+
+  // For each sampled image row, finds the largest contiguous run of
+  // shoulder-classified columns (robust to disjoint false-positive noise
+  // elsewhere in the row -- a global min/max column would wrongly span
+  // across two unrelated detections), takes its midpoint column, and
+  // back-projects that single pixel to base_link via ground-plane (z=0)
+  // inverse perspective mapping. Returns (x, y) points in base_link/
+  // output_frame, ground assumption z=0.
+  std::vector<Eigen::Vector2d> sampleMaskCenterline(
+    const cv::Mat & mask, const Eigen::Isometry3d & t_base_cam, double fx, double fy, double cx, double cy) const
+  {
+    std::vector<Eigen::Vector2d> samples;
+    const Eigen::Matrix3d r_base_cam = t_base_cam.rotation();
+    const Eigen::Vector3d c_base = t_base_cam.translation();
+
+    for (int row = 0; row < mask.rows; row += mask_row_step_) {
+      const uint8_t * row_ptr = mask.ptr<uint8_t>(row);
+      int run_start = -1, best_start = -1, best_len = 0;
+      for (int col = 0; col <= mask.cols; ++col) {
+        const bool on = (col < mask.cols) && (row_ptr[col] == shoulder_class_);
+        if (on) {
+          if (run_start < 0) {
+            run_start = col;
+          }
+        } else if (run_start >= 0) {
+          const int len = col - run_start;
+          if (len > best_len) {
+            best_len = len;
+            best_start = run_start;
+          }
+          run_start = -1;
+        }
+      }
+      if (best_len < min_mask_run_px_) {
+        continue;
+      }
+      const double center_col = best_start + 0.5 * (best_len - 1);
+
+      const Eigen::Vector3d d_cam((center_col - cx) / fx, (row - cy) / fy, 1.0);
+      const Eigen::Vector3d d_base = r_base_cam * d_cam;
+      if (d_base.z() >= -1e-6) {
+        continue;  // ray parallel to or pointing above the ground plane -- no valid intersection ahead
+      }
+      const double t = -c_base.z() / d_base.z();
+      if (t <= 0.0) {
+        continue;  // intersection behind the camera
+      }
+      const Eigen::Vector3d p = c_base + t * d_base;
+      if (p.x() < x_min_ || p.x() > x_max_) {
+        continue;
+      }
+      samples.emplace_back(p.x(), p.y());
+    }
+    return samples;
   }
 
   void onSynced(
@@ -345,20 +434,50 @@ private:
         continue;
       }
       ++banded_points;
-      const int b = static_cast<int>((p_base.x() - x_min_) / bin_size_);
-      if (b >= 0 && b < num_bins) {
-        bin_y[b].push_back(p_base.y());
-        bin_z[b].push_back(p_base.z());
-      }
 
-      if (t_map_base) {
-        const Eigen::Vector3d p_map = *t_map_base * p_base;
-        const long long world_key =
-          static_cast<long long>(std::floor((traveled_arclength_ + p_base.x()) / bin_size_));
-        auto & wb = world_bins_[world_key];
-        wb.x.push_back(p_map.x());
-        wb.y.push_back(p_map.y());
-        wb.z.push_back(p_map.z());
+      // When bin_source=mask_ipm (default), the LiDAR loop above still runs
+      // in full -- it's what produces painted_px and the diagnostic counts
+      // logged below -- but the bins themselves are populated separately,
+      // from the dense mask-boundary IPM samples (see below), not from these
+      // sparse LiDAR hits.
+      if (!use_mask_center_ipm_) {
+        const int b = static_cast<int>((p_base.x() - x_min_) / bin_size_);
+        if (b >= 0 && b < num_bins) {
+          bin_y[b].push_back(p_base.y());
+          bin_z[b].push_back(p_base.z());
+        }
+
+        if (t_map_base) {
+          const Eigen::Vector3d p_map = *t_map_base * p_base;
+          const long long world_key =
+            static_cast<long long>(std::floor((traveled_arclength_ + p_base.x()) / bin_size_));
+          auto & wb = world_bins_[world_key];
+          wb.x.push_back(p_map.x());
+          wb.y.push_back(p_map.y());
+          wb.z.push_back(p_map.z());
+        }
+      }
+    }
+
+    if (use_mask_center_ipm_) {
+      if (const auto t_base_cam_msg = lookup(output_frame_, cam_frame)) {
+        const Eigen::Isometry3d t_base_cam = tf2::transformToEigen(*t_base_cam_msg);
+        for (const auto & s : sampleMaskCenterline(mask, t_base_cam, fx, fy, cx, cy)) {
+          const int b = static_cast<int>((s.x() - x_min_) / bin_size_);
+          if (b >= 0 && b < num_bins) {
+            bin_y[b].push_back(s.y());
+            bin_z[b].push_back(0.0);
+          }
+          if (t_map_base) {
+            const Eigen::Vector3d p_map = *t_map_base * Eigen::Vector3d(s.x(), s.y(), 0.0);
+            const long long world_key =
+              static_cast<long long>(std::floor((traveled_arclength_ + s.x()) / bin_size_));
+            auto & wb = world_bins_[world_key];
+            wb.x.push_back(p_map.x());
+            wb.y.push_back(p_map.y());
+            wb.z.push_back(p_map.z());
+          }
+        }
       }
     }
 
@@ -613,6 +732,9 @@ private:
   std::string centerline_estimator_;
   bool use_extent_midpoint_;
   double edge_trim_fraction_;
+  bool use_mask_center_ipm_;
+  int mask_row_step_;
+  int min_mask_run_px_;
   double waypoint_spacing_, smoothing_alpha_;
   bool publish_debug_image_;
   int log_every_n_;
