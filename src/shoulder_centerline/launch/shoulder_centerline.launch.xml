@@ -23,6 +23,9 @@
   <arg name="centerline_estimator" default="extent_midpoint" description="How each bin's lateral center is computed: 'extent_midpoint' (default) takes the midpoint of the (trimmed) left/right edge of samples -- the standard lane-centerline technique; 'median' is the old density-weighted centroid, which was biased toward whichever edge got more samples. Set to 'median' to instantly revert (no rebuild) if extent_midpoint regresses."/>
   <arg name="edge_trim_fraction" default="0.1" description="Fraction trimmed off each end before taking the extent midpoint, to reject outlier points. Only used when centerline_estimator=extent_midpoint"/>
 
+  <arg name="enable_outlier_rejection" default="true" description="Reject bins that disagree with a robust (Theil-Sen) linear trend through this frame's valid bins -- fixes a hook/reversal at the end of a sparse bin run (too few bins for the spline to average out one noisy bin) that would otherwise bias both the local path AND the accumulated path. Set to false to instantly revert (no rebuild)."/>
+  <arg name="outlier_rejection_threshold" default="0.5" description="Bins whose lateral value deviates from the robust trend by more than this (m) are rejected"/>
+
   <arg name="waypoint_spacing" default="1.0" description="Arclength spacing (m) between output waypoints"/>
   <arg name="smoothing_alpha" default="0.3" description="EMA factor for frame-to-frame lateral-offset smoothing; 1.0 = no smoothing"/>
 
@@ -54,6 +57,8 @@
     <param name="min_mask_run_px" value="$(var min_mask_run_px)"/>
     <param name="centerline_estimator" value="$(var centerline_estimator)"/>
     <param name="edge_trim_fraction" value="$(var edge_trim_fraction)"/>
+    <param name="enable_outlier_rejection" value="$(var enable_outlier_rejection)"/>
+    <param name="outlier_rejection_threshold" value="$(var outlier_rejection_threshold)"/>
     <param name="waypoint_spacing" value="$(var waypoint_spacing)"/>
     <param name="smoothing_alpha" value="$(var smoothing_alpha)"/>
     <param name="publish_debug_image" value="$(var publish_debug_image)"/>
