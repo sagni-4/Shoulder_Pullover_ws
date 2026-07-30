@@ -45,6 +45,8 @@
   <arg name="centerline_bin_size" default="1.0"/>
   <arg name="centerline_min_points_per_bin" default="3" description="Lower this if bins stay empty (check the node's log: lidar -> in_img -> painted -> banded -> bins) -- this CARLA LiDAR config only yields ~30-40 painted points/frame spread across the full range"/>
   <arg name="centerline_min_valid_bins" default="4"/>
+  <arg name="centerline_estimator" default="extent_midpoint" description="'extent_midpoint' (default) centers on the midpoint of the shoulder's left/right edge, the standard lane-centerline technique; 'median' is the old density-weighted centroid that was biased toward whichever edge got more LiDAR hits -- set to 'median' to instantly revert (no rebuild)"/>
+  <arg name="centerline_edge_trim_fraction" default="0.1"/>
   <arg name="centerline_waypoint_spacing" default="1.0"/>
   <arg name="centerline_smoothing_alpha" default="0.3"/>
   <arg name="centerline_accumulate_path" default="true" description="Also publish a growing map-frame Path (~/shoulder_centerline_path_map), built from world-frame LiDAR-sample bins (median of every sample ever observed per bin), in addition to the local ego-relative window"/>
@@ -97,6 +99,8 @@
     <arg name="bin_size" value="$(var centerline_bin_size)"/>
     <arg name="min_points_per_bin" value="$(var centerline_min_points_per_bin)"/>
     <arg name="min_valid_bins" value="$(var centerline_min_valid_bins)"/>
+    <arg name="centerline_estimator" value="$(var centerline_estimator)"/>
+    <arg name="edge_trim_fraction" value="$(var centerline_edge_trim_fraction)"/>
     <arg name="waypoint_spacing" value="$(var centerline_waypoint_spacing)"/>
     <arg name="smoothing_alpha" value="$(var centerline_smoothing_alpha)"/>
     <arg name="accumulate_path" value="$(var centerline_accumulate_path)"/>

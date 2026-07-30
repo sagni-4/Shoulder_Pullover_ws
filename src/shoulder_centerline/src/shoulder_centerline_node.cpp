@@ -96,6 +96,28 @@ double median(std::vector<double> v)
   return m;
 }
 
+// A per-frame (or per-world-bin) median of raw painted-point lateral offsets
+// is a *density-weighted* centroid: whichever edge of the shoulder happens to
+// get more LiDAR hits (scan-pattern/incidence-angle dependent, not uniform
+// across the lane's width) pulls the estimate toward it, off the true
+// geometric center. Classic lane-detection literature instead finds the
+// left/right boundary of the classified region and takes their midpoint
+// (e.g. the sliding-window/histogram lane-finding technique, and "the
+// lane-center line calculated as the average between the left and right
+// lane boundary" in lane-sensing patents/surveys) -- that's what this does,
+// using a trimmed (not bare) min/max so a single outlier point doesn't drag
+// one edge out: sort, drop the extreme `trim_fraction` at each end, take the
+// midpoint of what's left.
+double robustExtentMidpoint(std::vector<double> v, double trim_fraction)
+{
+  std::sort(v.begin(), v.end());
+  const std::size_t n = v.size();
+  const std::size_t trim = static_cast<std::size_t>(std::clamp(trim_fraction, 0.0, 0.49) * n);
+  const double low = v[trim];
+  const double high = v[n - 1 - trim];
+  return 0.5 * (low + high);
+}
+
 }  // namespace
 
 class ShoulderCenterlineNode : public rclcpp::Node
@@ -126,6 +148,20 @@ public:
     min_valid_bins_ = declare_parameter<int>("min_valid_bins", 4);
     z_min_ = declare_parameter<double>("z_min", -0.3);
     z_max_ = declare_parameter<double>("z_max", 0.5);
+
+    // How each bin's lateral (y) center is computed from its raw painted
+    // points. "median" is a density-weighted centroid -- biased toward
+    // whichever edge of the shoulder happens to get more LiDAR hits, which is
+    // scan-pattern/incidence-angle dependent, not the true lane center.
+    // "extent_midpoint" (default) instead finds the left/right edge of the
+    // classified points (robust/trimmed, see robustExtentMidpoint()) and
+    // takes their midpoint -- the standard lane-centerline technique. Set
+    // back to "median" (no rebuild needed) to instantly revert if this
+    // causes a regression; see also the git checkpoint committed in this
+    // workspace right before this parameter was introduced.
+    centerline_estimator_ = declare_parameter<std::string>("centerline_estimator", "extent_midpoint");
+    use_extent_midpoint_ = (centerline_estimator_ == "extent_midpoint");
+    edge_trim_fraction_ = declare_parameter<double>("edge_trim_fraction", 0.1);
 
     waypoint_spacing_ = declare_parameter<double>("waypoint_spacing", 1.0);
     smoothing_alpha_ = declare_parameter<double>("smoothing_alpha", 0.3);
@@ -211,6 +247,11 @@ private:
         source_frame.c_str(), target_frame.c_str(), ex.what());
       return std::nullopt;
     }
+  }
+
+  double lateralCenter(const std::vector<double> & y) const
+  {
+    return use_extent_midpoint_ ? robustExtentMidpoint(y, edge_trim_fraction_) : median(y);
   }
 
   void onSynced(
@@ -329,7 +370,7 @@ private:
       }
       ++valid_bins;
       cx_list.push_back(x_min_ + (b + 0.5) * bin_size_);
-      cy_list.push_back(median(bin_y[b]));
+      cy_list.push_back(lateralCenter(bin_y[b]));
       cz_list.push_back(median(bin_z[b]));
     }
 
@@ -490,7 +531,7 @@ private:
       if (static_cast<int>(wb.x.size()) < min_world_bin_samples_) {
         continue;
       }
-      points.emplace_back(median(wb.x), median(wb.y), median(wb.z));
+      points.emplace_back(median(wb.x), lateralCenter(wb.y), median(wb.z));
     }
 
     path.poses.reserve(points.size());
@@ -569,6 +610,9 @@ private:
   double x_min_, x_max_, bin_size_;
   int min_points_per_bin_, min_valid_bins_;
   double z_min_, z_max_;
+  std::string centerline_estimator_;
+  bool use_extent_midpoint_;
+  double edge_trim_fraction_;
   double waypoint_spacing_, smoothing_alpha_;
   bool publish_debug_image_;
   int log_every_n_;
