@@ -27,22 +27,9 @@
 //   2. Bin by forward distance, take a lateral center per bin
 //      (centerline_estimator: extent-midpoint of the samples, or median),
 //      density-gated.
-//   3. Separately, reject bins that disagree with a robust (Theil-Sen)
-//      linear trend through this frame's valid bins by more than
-//      outlier_rejection_threshold, but only to decide which bins' raw
-//      samples are allowed into the world-frame accumulation (step 4b) --
-//      deliberately NOT applied to the local fit in step 4a. With only a
-//      handful of valid bins (a sparsely-detected stretch), Theil-Sen itself
-//      is fragile (a small outlier minority is already near its statistical
-//      breakdown point with so few points), so filtering the local fit's
-//      input too caused its own regression (a short, wrongly-trimmed local
-//      path) rather than helping. The accumulated trail is worth protecting
-//      from a single bad frame regardless (it's far harder to walk back
-//      once baked in over many frames); the local fit is re-derived fresh
-//      every frame anyway, so an occasional bad frame there is self-healing.
-//   4a. Fit a natural cubic spline (uniform-knot parametrization over ALL
-//      this frame's valid bins -- see cubic_spline.hpp), resample at fixed
-//      arclength spacing for waypoints with
+//   4. Fit a natural cubic spline (uniform-knot parametrization over the
+//      valid bin sequence -- see cubic_spline.hpp) through the bin
+//      centroids, resample at fixed arclength spacing for waypoints with
 //      heading (first derivative) and signed curvature
 //      kappa = (x'y'' - y'x'') / (x'^2+y'^2)^1.5 (standard Frenet-frame form).
 //   5. Light exponential moving average per arclength step, frame to frame.
@@ -142,45 +129,6 @@ double robustExtentMidpoint(std::vector<double> v, double trim_fraction)
   return 0.5 * (low + high);
 }
 
-// With very few bins (e.g. right after a stretch too sparse to detect the
-// shoulder at all -- min_valid_bins is only 4 by default), a natural cubic
-// spline has almost no averaging effect: it interpolates each knot nearly
-// exactly, so if the *last* one or two of those few bins are noisy (the
-// bins closest to the density threshold are, by construction, the least
-// well-sampled), the fitted curve faithfully follows that noise instead of
-// smoothing over it -- producing a hook/reversal right where the good data
-// runs out. The Theil-Sen estimator (median of all pairwise slopes, then
-// median of the resulting intercepts) is a classic robust regression
-// technique (Sen 1968; generalizes Theil 1950) built exactly for this: it
-// tolerates up to ~29% of points being arbitrary outliers without being
-// pulled off the true trend by them, unlike an ordinary least-squares line.
-// Used here only to *detect* which bins disagree with the trend enough to
-// be excluded before fitting/accumulating -- not as the final curve shape.
-std::pair<double, double> theilSenFit(const std::vector<double> & xs, const std::vector<double> & ys)
-{
-  const std::size_t n = xs.size();
-  std::vector<double> slopes;
-  slopes.reserve(n * (n - 1) / 2);
-  for (std::size_t i = 0; i < n; ++i) {
-    for (std::size_t j = i + 1; j < n; ++j) {
-      const double dx = xs[j] - xs[i];
-      if (std::abs(dx) > 1e-9) {
-        slopes.push_back((ys[j] - ys[i]) / dx);
-      }
-    }
-  }
-  if (slopes.empty()) {
-    return {0.0, n > 0 ? ys[0] : 0.0};
-  }
-  const double slope = median(slopes);
-  std::vector<double> intercepts;
-  intercepts.reserve(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    intercepts.push_back(ys[i] - slope * xs[i]);
-  }
-  return {slope, median(intercepts)};
-}
-
 }  // namespace
 
 class ShoulderCenterlineNode : public rclcpp::Node
@@ -225,17 +173,6 @@ public:
     centerline_estimator_ = declare_parameter<std::string>("centerline_estimator", "extent_midpoint");
     use_extent_midpoint_ = (centerline_estimator_ == "extent_midpoint");
     edge_trim_fraction_ = declare_parameter<double>("edge_trim_fraction", 0.1);
-
-    // Rejects bins whose lateral value disagrees with a robust (Theil-Sen)
-    // linear trend through all this frame's valid bins by more than
-    // outlier_rejection_threshold meters -- rejected bins are excluded from
-    // BOTH the local spline fit and the world-frame accumulation, so a bad
-    // bin can no longer bias either published line (see the module comment
-    // on theilSenFit() for why this specific failure mode needed a robust
-    // estimator, not just more smoothing). Set enable_outlier_rejection to
-    // false to instantly revert (no rebuild) if this ever rejects good data.
-    enable_outlier_rejection_ = declare_parameter<bool>("enable_outlier_rejection", true);
-    outlier_rejection_threshold_ = declare_parameter<double>("outlier_rejection_threshold", 0.5);
 
     // Where the lateral sample for each bin comes from in the first place.
     // "lidar": project LiDAR points into the mask, keep the ones landing on
@@ -460,13 +397,6 @@ private:
 
     const int num_bins = static_cast<int>(std::ceil((x_max_ - x_min_) / bin_size_));
     std::vector<std::vector<double>> bin_y(num_bins), bin_z(num_bins);
-    // Raw-x/map-frame-point pairs per bin, collected but *not yet* pushed
-    // into world_bins_ -- deferred until after outlier rejection below
-    // decides which bins are trustworthy, so a rejected bin can't leak into
-    // the accumulated path either. raw_x is needed (not just the map-frame
-    // point) because the world-bin key depends on the sample's actual
-    // ego-relative forward distance, not the bin's nominal center.
-    std::vector<std::vector<std::pair<double, Eigen::Vector3d>>> bin_world_candidates(num_bins);
     std::vector<cv::Point> painted_px;
 
     std::size_t total_points = 0, in_bounds_points = 0, painted_points = 0, banded_points = 0;
@@ -515,9 +445,16 @@ private:
         if (b >= 0 && b < num_bins) {
           bin_y[b].push_back(p_base.y());
           bin_z[b].push_back(p_base.z());
-          if (t_map_base) {
-            bin_world_candidates[b].emplace_back(p_base.x(), *t_map_base * p_base);
-          }
+        }
+
+        if (t_map_base) {
+          const Eigen::Vector3d p_map = *t_map_base * p_base;
+          const long long world_key =
+            static_cast<long long>(std::floor((traveled_arclength_ + p_base.x()) / bin_size_));
+          auto & wb = world_bins_[world_key];
+          wb.x.push_back(p_map.x());
+          wb.y.push_back(p_map.y());
+          wb.z.push_back(p_map.z());
         }
       }
     }
@@ -530,52 +467,30 @@ private:
           if (b >= 0 && b < num_bins) {
             bin_y[b].push_back(s.y());
             bin_z[b].push_back(0.0);
-            if (t_map_base) {
-              bin_world_candidates[b].emplace_back(s.x(), *t_map_base * Eigen::Vector3d(s.x(), s.y(), 0.0));
-            }
+          }
+          if (t_map_base) {
+            const Eigen::Vector3d p_map = *t_map_base * Eigen::Vector3d(s.x(), s.y(), 0.0);
+            const long long world_key =
+              static_cast<long long>(std::floor((traveled_arclength_ + s.x()) / bin_size_));
+            auto & wb = world_bins_[world_key];
+            wb.x.push_back(p_map.x());
+            wb.y.push_back(p_map.y());
+            wb.z.push_back(p_map.z());
           }
         }
       }
     }
 
     std::vector<double> cx_list, cy_list, cz_list;
-    std::vector<int> valid_bin_idx;
     int valid_bins = 0;
     for (int b = 0; b < num_bins; ++b) {
       if (static_cast<int>(bin_y[b].size()) < min_points_per_bin_) {
         continue;
       }
       ++valid_bins;
-      valid_bin_idx.push_back(b);
       cx_list.push_back(x_min_ + (b + 0.5) * bin_size_);
       cy_list.push_back(lateralCenter(bin_y[b]));
       cz_list.push_back(median(bin_z[b]));
-    }
-
-    // Reject bins that disagree with a robust trend through this frame's
-    // valid bins (see theilSenFit()'s comment) -- used ONLY to gate what
-    // enters the world-bin accumulation below, deliberately NOT to filter
-    // the local fit's input. The local path already looked fine before this
-    // was added, and with only a handful of bins per frame here, Theil-Sen
-    // itself is fragile (a 2-of-5 "outlier" minority is already close to its
-    // statistical breakdown point) -- applying it to the local fit too was a
-    // regression: it could trim down to a short, wrongly-selected subset
-    // instead of just protecting the (much harder to undo) accumulated
-    // trail from a single bad frame's bin.
-    std::vector<bool> bin_accepted(num_bins, false);
-    for (const int b : valid_bin_idx) {
-      bin_accepted[b] = true;
-    }
-    int rejected_bins = 0;
-    if (enable_outlier_rejection_ && cx_list.size() >= 3) {
-      const auto [slope, intercept] = theilSenFit(cx_list, cy_list);
-      for (std::size_t i = 0; i < cx_list.size(); ++i) {
-        const double predicted = slope * cx_list[i] + intercept;
-        if (std::abs(cy_list[i] - predicted) > outlier_rejection_threshold_) {
-          bin_accepted[valid_bin_idx[i]] = false;
-          ++rejected_bins;
-        }
-      }
     }
 
     std::vector<Waypoint> waypoints;
@@ -588,22 +503,9 @@ private:
     }
 
     // Independent of the local per-frame fit above -- the world bins are
-    // populated from the same accepted-bin candidates collected in the main
-    // loop, so this publishes/refines even on frames where the local fit
-    // didn't converge (e.g. too few accepted bins for min_valid_bins_).
+    // populated directly from banded LiDAR points in the main loop, so this
+    // publishes/refines even on frames where the local fit didn't converge.
     if (accumulate_path_ && t_map_base) {
-      for (int b = 0; b < num_bins; ++b) {
-        if (!bin_accepted[b]) {
-          continue;
-        }
-        for (const auto & [raw_x, p_map] : bin_world_candidates[b]) {
-          const long long world_key = static_cast<long long>(std::floor((traveled_arclength_ + raw_x) / bin_size_));
-          auto & wb = world_bins_[world_key];
-          wb.x.push_back(p_map.x());
-          wb.y.push_back(p_map.y());
-          wb.z.push_back(p_map.z());
-        }
-      }
       publishAccumulatedPath(mask_msg->header.stamp);
     }
 
@@ -617,10 +519,10 @@ private:
     if (frame_idx_ % static_cast<std::size_t>(std::max(1, log_every_n_)) == 0) {
       RCLCPP_INFO(
         get_logger(),
-        "frame %6zu | %5.1f ms | lidar %zu -> in_img %zu -> painted %zu -> banded %zu | bins %d/%d "
-        "(rejected %d) | waypoints %zu",
+        "frame %6zu | %5.1f ms | lidar %zu -> in_img %zu -> painted %zu -> banded %zu | bins %d/%d | "
+        "waypoints %zu",
         frame_idx_, dt_ms, total_points, in_bounds_points, painted_points, banded_points, valid_bins, num_bins,
-        rejected_bins, waypoints.size());
+        waypoints.size());
     }
     ++frame_idx_;
   }
@@ -830,8 +732,6 @@ private:
   std::string centerline_estimator_;
   bool use_extent_midpoint_;
   double edge_trim_fraction_;
-  bool enable_outlier_rejection_;
-  double outlier_rejection_threshold_;
   bool use_mask_center_ipm_;
   int mask_row_step_;
   int min_mask_run_px_;
