@@ -240,15 +240,12 @@ public:
     min_world_bin_samples_ = declare_parameter<int>("min_world_bin_samples", 20);
     // Caps how many finalized world bins are retained/published (oldest dropped first).
     max_accumulated_points_ = declare_parameter<int>("max_accumulated_points", 2000);
-    // Excludes the farthest N valid bins each frame from world-bin
-    // accumulation only (never the local path) -- the newest/farthest bin
-    // in view hasn't been confirmed by a closer look yet, and consistently
-    // contributing that unreliable first look is what produced a persistent
-    // kink in the accumulated trail at a fixed distance ahead of the
-    // vehicle, baked in fresh every time any bin passed through the
-    // "farthest" position. A real stretch of shoulder gets several more
-    // chances to contribute once it's no longer the farthest thing in view.
-    world_bin_far_margin_ = declare_parameter<int>("world_bin_far_margin", 2);
+    // Excludes the nearest N valid bins each frame from world-bin
+    // accumulation only (never the local path). At short range the mask_ipm
+    // ray is nearly vertical, so small mask-boundary pixel noise there maps
+    // to a large swing in the back-projected ground point -- confirmed by
+    // the user seeing exactly this as a curve at the start of the local path.
+    world_bin_near_margin_ = declare_parameter<int>("world_bin_near_margin", 1);
 
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -408,7 +405,7 @@ private:
     std::vector<std::vector<double>> bin_y(num_bins), bin_z(num_bins);
     // Raw-x/map-frame-point pairs per bin, collected but not yet pushed into
     // world_bins_ -- deferred until after we know which bins are the
-    // frame's farthest valid ones (see world_bin_far_margin_ below), so
+    // frame's nearest valid ones (see world_bin_near_margin_ below), so
     // those can be excluded from the accumulation without touching the
     // local fit at all.
     std::vector<std::vector<std::pair<double, Eigen::Vector3d>>> bin_world_candidates(num_bins);
@@ -497,21 +494,20 @@ private:
       cz_list.push_back(median(bin_z[b]));
     }
 
-    // The farthest bin(s) currently in view are, by construction, the
-    // newest/least-confirmed detection of whatever real-world stretch they
-    // cover -- a sparse run's farthest bin is consistently the least
-    // reliable (see the module comment above), and since world accumulation
-    // pulls from every frame, that same unreliable "just came into view"
-    // sample would otherwise get baked into the permanent trail every time
-    // any bin passes through the "farthest" position. Excluding the
-    // farthest world_bin_far_margin_ valid bins from world accumulation
-    // only (never the local path, which already looks right) means a real
-    // stretch of shoulder gets confirmed by closer, more reliable looks in
-    // later frames before it's ever committed.
+    // The nearest bin(s) each frame can be unreliable: at short range the
+    // mask_ipm ray is nearly vertical, so small mask-boundary pixel noise
+    // there maps to a large swing in the back-projected ground point --
+    // directly confirmed by the user seeing a curve at the *start* of the
+    // local path. Excluding world_bin_near_margin_ nearest valid bins from
+    // world accumulation only (never the local path, which already looks
+    // right on its own) keeps that curve from being baked into the
+    // permanent trail. Deliberately NOT also excluding the farthest bins
+    // (an earlier version of this did) -- the user asked for that reverted,
+    // since 58183c7's original (unrestricted) far end already looked right.
     std::vector<bool> bin_world_eligible(num_bins, false);
     {
-      const int cutoff = std::max(0, static_cast<int>(valid_bin_idx.size()) - world_bin_far_margin_);
-      for (int i = 0; i < cutoff; ++i) {
+      const int near_cutoff = std::min(static_cast<int>(valid_bin_idx.size()), world_bin_near_margin_);
+      for (int i = near_cutoff; i < static_cast<int>(valid_bin_idx.size()); ++i) {
         bin_world_eligible[valid_bin_idx[i]] = true;
       }
     }
@@ -780,7 +776,7 @@ private:
   int max_accumulated_points_;
   std::string accumulated_path_topic_;
   int min_world_bin_samples_;
-  int world_bin_far_margin_;
+  int world_bin_near_margin_;
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
