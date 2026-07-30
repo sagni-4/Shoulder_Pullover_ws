@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <!-- Model / input -->
+  <arg name="image_topic" default="/sensing/camera/CAM_FRONT/image_raw"
+       description="Camera topic published by autoware_carla_interface"/>
+  <arg name="arch" default="dinov2" description="dinov2 | dinov3 | segformer | mask2former"/>
+  <arg name="checkpoint" default="" description="Model checkpoint path; empty = the node's own default under SHOULDER_PROJECT_ROOT"/>
+  <arg name="half" default="false" description="FP16 inference (CUDA only). Worth trying if the model feels slow, but on this machine the dominant bottleneck is GPU contention with CARLA's own rendering + Autoware's perception stack, not precision -- see shoulder_overlay_viewer_node's module docstring"/>
+  <arg name="alpha" default="0.45" description="Full (all 3 classes) overlay blend weight"/>
+
+  <!-- Shoulder-only overlay: same cv2.addWeighted blend technique as the
+       full overlay above, but only shoulder pixels are tinted, travel_lane/
+       non_driveable pixels stay as the original camera image. Published on
+       ~/shoulder_only_overlay_image
+       (/shoulder_detection_node/shoulder_only_overlay_image). -->
+  <arg name="shoulder_overlay_color_bgr" default="[245, 61, 61]" description="BGR order; matches the CVAT annotation color used consistently across the project (infer.py, cvat_seg_to_masks.py)"/>
+  <arg name="shoulder_overlay_alpha" default="0.55"/>
+
+  <!-- Live overlay windows, shown alongside the CARLA game window. CARLA's
+       own 3D viewport can't be post-processed with a pixel overlay from
+       outside (its debug-draw API is unlit lines/points/boxes only, no
+       filled-polygon or flat image-blend capability), so these are separate
+       on-screen windows (cv2.imshow), not anything drawn into CARLA itself.
+       Two independent styles, each independently toggleable so either or
+       both can be shown at once:
+         - "shoulder only": ~/shoulder_only_overlay_image, just the shoulder
+           tinted, everything else the plain camera image.
+         - "full classes": ~/overlay_image, all 3 classes tinted, matching
+           the look of shoulder_detection_carla.py's own pygame HUD demo.
+       Both include a small HUD bar with a live FPS counter + class
+       fractions (toggle per-window with show_hud below). -->
+  <arg name="enable_shoulder_only_viewer_window" default="true" description="Show the shoulder-only live overlay window"/>
+  <arg name="shoulder_only_viewer_window_name" default="Shoulder detection (shoulder only)"/>
+  <arg name="enable_full_class_viewer_window" default="false" description="Show the full (all 3 classes) live overlay window"/>
+  <arg name="full_class_viewer_window_name" default="Shoulder detection (all classes)"/>
+  <arg name="viewer_show_hud" default="true" description="Draw an FPS + class-fraction HUD bar on the live overlay window(s)"/>
+
+  <!-- Ego-relative shoulder centerline waypoint generation: paints the live
+       LiDAR cloud with this node's shoulder mask (PointPainting-style
+       fusion) and publishes ego-frame waypoints. Separate C++ package
+       (shoulder_centerline) for speed: pure geometry, no GPU/venv. -->
+  <arg name="enable_centerline_node" default="true"/>
+  <arg name="centerline_x_min" default="3.0"/>
+  <arg name="centerline_x_max" default="40.0"/>
+  <arg name="centerline_bin_size" default="1.0"/>
+  <arg name="centerline_min_points_per_bin" default="3" description="Lower this if bins stay empty (check the node's log: lidar -> in_img -> painted -> banded -> bins) -- this CARLA LiDAR config only yields ~30-40 painted points/frame spread across the full range"/>
+  <arg name="centerline_min_valid_bins" default="4"/>
+  <arg name="centerline_waypoint_spacing" default="1.0"/>
+  <arg name="centerline_smoothing_alpha" default="0.3"/>
+  <arg name="centerline_accumulate_path" default="true" description="Also publish a growing map-frame Path (~/shoulder_centerline_path_map), built from world-frame LiDAR-sample bins (median of every sample ever observed per bin), in addition to the local ego-relative window"/>
+  <arg name="centerline_min_world_bin_samples" default="20" description="Raise if the accumulated trail still looks jittery -- trades a longer lag behind the vehicle for a smoother median (each real-world segment is typically sampled 50-100+ times before the vehicle passes it)"/>
+
+  <!-- RViz -->
+  <arg name="rviz" default="false" description="Launch a standalone RViz with this package's Image displays"/>
+
+  <node pkg="shoulder_detection_ros" exec="shoulder_detection_node" name="shoulder_detection_node" output="screen">
+    <param name="image_topic" value="$(var image_topic)"/>
+    <param name="arch" value="$(var arch)"/>
+    <param name="checkpoint" value="$(var checkpoint)"/>
+    <param name="half" value="$(var half)"/>
+    <param name="alpha" value="$(var alpha)"/>
+    <param name="shoulder_overlay_color_bgr" value="$(var shoulder_overlay_color_bgr)"/>
+    <param name="shoulder_overlay_alpha" value="$(var shoulder_overlay_alpha)"/>
+  </node>
+
+  <node
+    pkg="shoulder_detection_ros"
+    exec="shoulder_overlay_viewer_node"
+    name="shoulder_overlay_viewer_shoulder_only"
+    output="screen"
+    if="$(var enable_shoulder_only_viewer_window)"
+  >
+    <!-- image_topic default already matches shoulder_detection_node's
+         ~/shoulder_only_overlay_image as long as neither node is renamed -->
+    <param name="window_name" value="$(var shoulder_only_viewer_window_name)"/>
+    <param name="show_hud" value="$(var viewer_show_hud)"/>
+    <param name="hud_label" value="shoulder-only"/>
+  </node>
+
+  <node
+    pkg="shoulder_detection_ros"
+    exec="shoulder_overlay_viewer_node"
+    name="shoulder_overlay_viewer_full_class"
+    output="screen"
+    if="$(var enable_full_class_viewer_window)"
+  >
+    <param name="image_topic" value="/shoulder_detection_node/overlay_image"/>
+    <param name="window_name" value="$(var full_class_viewer_window_name)"/>
+    <param name="show_hud" value="$(var viewer_show_hud)"/>
+    <param name="hud_label" value="$(var arch)"/>
+  </node>
+
+  <include file="$(find-pkg-share shoulder_centerline)/launch/shoulder_centerline.launch.xml"
+           if="$(var enable_centerline_node)">
+    <arg name="x_min" value="$(var centerline_x_min)"/>
+    <arg name="x_max" value="$(var centerline_x_max)"/>
+    <arg name="bin_size" value="$(var centerline_bin_size)"/>
+    <arg name="min_points_per_bin" value="$(var centerline_min_points_per_bin)"/>
+    <arg name="min_valid_bins" value="$(var centerline_min_valid_bins)"/>
+    <arg name="waypoint_spacing" value="$(var centerline_waypoint_spacing)"/>
+    <arg name="smoothing_alpha" value="$(var centerline_smoothing_alpha)"/>
+    <arg name="accumulate_path" value="$(var centerline_accumulate_path)"/>
+    <arg name="min_world_bin_samples" value="$(var centerline_min_world_bin_samples)"/>
+  </include>
+
+  <node pkg="rviz2" exec="rviz2" name="shoulder_detection_rviz" output="screen"
+        args="-d $(find-pkg-share shoulder_detection_ros)/rviz/shoulder_detection.rviz"
+        if="$(var rviz)"/>
+</launch>

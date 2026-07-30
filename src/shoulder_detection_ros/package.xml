@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>shoulder_detection_ros</name>
+  <version>0.1.0</version>
+  <description>
+    Runs the trained DINOv2 road-shoulder segmentation model on Autoware's
+    live CARLA camera feed, publishes the result for RViz, and shows a live
+    shoulder-only overlay window alongside the CARLA game window.
+  </description>
+  <maintainer email="dev@example.com">dev</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>cv_bridge</depend>
+  <exec_depend>shoulder_centerline</exec_depend>
+
+  <!--
+    Not declared here (not ROS/rosdep packages): torch, transformers,
+    albumentations. These come from the dedicated Python virtualenv created
+    by setup_venv.sh at the workspace root, see the top-level README. This
+    package must be built with that venv active so its console_scripts are
+    installed with the right interpreter.
+  -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

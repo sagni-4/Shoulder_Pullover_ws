@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>shoulder_centerline</name>
+  <version>0.1.0</version>
+  <description>
+    Ego-relative shoulder centerline waypoint generation: paints the live
+    LiDAR point cloud with shoulder_detection_node's 2D shoulder mask
+    (PointPainting-style semantic fusion), bins/fits/resamples the resulting
+    ego-frame points into arclength-spaced waypoints with heading and
+    curvature. Pure C++/Eigen/OpenCV geometry node, no learned model of its
+    own, kept separate from the Python model-inference package for speed.
+  </description>
+  <maintainer email="dev@example.com">dev</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_eigen</depend>
+  <depend>message_filters</depend>
+  <depend>cv_bridge</depend>
+  <depend>eigen</depend>
+  <depend>eigen3_cmake_module</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
