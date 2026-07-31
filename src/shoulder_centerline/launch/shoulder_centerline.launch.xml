@@ -33,7 +33,6 @@
   <arg name="min_world_bin_samples" default="20" description="Minimum accumulated raw-point samples (across ALL frames) a world bin needs before it appears in the published path. Higher = smoother (each real-world 1m segment is visible ~50-100+ times as the vehicle approaches, so this converges fast) but a longer lag behind the vehicle before that stretch appears"/>
   <arg name="max_accumulated_points" default="2000" description="Caps how many finalized world bins are retained/published (oldest dropped first)"/>
   <arg name="accumulated_path_topic" default="~/shoulder_centerline_path_map"/>
-  <arg name="world_bin_near_margin" default="1" description="Exclude the nearest N valid bins each frame from world-bin accumulation only (never the local path) -- at short range the mask_ipm ray is nearly vertical, so small mask-boundary noise there maps to a large swing in the back-projected point, producing a curve at the start of the local path that would otherwise get baked into the accumulated trail. Set to 0 to disable (no rebuild)."/>
 
   <node pkg="shoulder_centerline" exec="shoulder_centerline_node" name="shoulder_centerline_node" output="screen">
     <param name="image_topic" value="$(var image_topic)"/>
@@ -63,6 +62,5 @@
     <param name="min_world_bin_samples" value="$(var min_world_bin_samples)"/>
     <param name="max_accumulated_points" value="$(var max_accumulated_points)"/>
     <param name="accumulated_path_topic" value="$(var accumulated_path_topic)"/>
-    <param name="world_bin_near_margin" value="$(var world_bin_near_margin)"/>
   </node>
 </launch>

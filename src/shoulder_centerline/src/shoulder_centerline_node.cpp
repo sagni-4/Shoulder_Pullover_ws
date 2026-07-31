@@ -240,12 +240,6 @@ public:
     min_world_bin_samples_ = declare_parameter<int>("min_world_bin_samples", 20);
     // Caps how many finalized world bins are retained/published (oldest dropped first).
     max_accumulated_points_ = declare_parameter<int>("max_accumulated_points", 2000);
-    // Excludes the nearest N valid bins each frame from world-bin
-    // accumulation only (never the local path). At short range the mask_ipm
-    // ray is nearly vertical, so small mask-boundary pixel noise there maps
-    // to a large swing in the back-projected ground point -- confirmed by
-    // the user seeing exactly this as a curve at the start of the local path.
-    world_bin_near_margin_ = declare_parameter<int>("world_bin_near_margin", 1);
 
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -403,12 +397,6 @@ private:
 
     const int num_bins = static_cast<int>(std::ceil((x_max_ - x_min_) / bin_size_));
     std::vector<std::vector<double>> bin_y(num_bins), bin_z(num_bins);
-    // Raw-x/map-frame-point pairs per bin, collected but not yet pushed into
-    // world_bins_ -- deferred until after we know which bins are the
-    // frame's nearest valid ones (see world_bin_near_margin_ below), so
-    // those can be excluded from the accumulation without touching the
-    // local fit at all.
-    std::vector<std::vector<std::pair<double, Eigen::Vector3d>>> bin_world_candidates(num_bins);
     std::vector<cv::Point> painted_px;
 
     std::size_t total_points = 0, in_bounds_points = 0, painted_points = 0, banded_points = 0;
@@ -457,9 +445,16 @@ private:
         if (b >= 0 && b < num_bins) {
           bin_y[b].push_back(p_base.y());
           bin_z[b].push_back(p_base.z());
-          if (t_map_base) {
-            bin_world_candidates[b].emplace_back(p_base.x(), *t_map_base * p_base);
-          }
+        }
+
+        if (t_map_base) {
+          const Eigen::Vector3d p_map = *t_map_base * p_base;
+          const long long world_key =
+            static_cast<long long>(std::floor((traveled_arclength_ + p_base.x()) / bin_size_));
+          auto & wb = world_bins_[world_key];
+          wb.x.push_back(p_map.x());
+          wb.y.push_back(p_map.y());
+          wb.z.push_back(p_map.z());
         }
       }
     }
@@ -472,44 +467,30 @@ private:
           if (b >= 0 && b < num_bins) {
             bin_y[b].push_back(s.y());
             bin_z[b].push_back(0.0);
-            if (t_map_base) {
-              bin_world_candidates[b].emplace_back(s.x(), *t_map_base * Eigen::Vector3d(s.x(), s.y(), 0.0));
-            }
+          }
+          if (t_map_base) {
+            const Eigen::Vector3d p_map = *t_map_base * Eigen::Vector3d(s.x(), s.y(), 0.0);
+            const long long world_key =
+              static_cast<long long>(std::floor((traveled_arclength_ + s.x()) / bin_size_));
+            auto & wb = world_bins_[world_key];
+            wb.x.push_back(p_map.x());
+            wb.y.push_back(p_map.y());
+            wb.z.push_back(p_map.z());
           }
         }
       }
     }
 
     std::vector<double> cx_list, cy_list, cz_list;
-    std::vector<int> valid_bin_idx;
     int valid_bins = 0;
     for (int b = 0; b < num_bins; ++b) {
       if (static_cast<int>(bin_y[b].size()) < min_points_per_bin_) {
         continue;
       }
       ++valid_bins;
-      valid_bin_idx.push_back(b);
       cx_list.push_back(x_min_ + (b + 0.5) * bin_size_);
       cy_list.push_back(lateralCenter(bin_y[b]));
       cz_list.push_back(median(bin_z[b]));
-    }
-
-    // The nearest bin(s) each frame can be unreliable: at short range the
-    // mask_ipm ray is nearly vertical, so small mask-boundary pixel noise
-    // there maps to a large swing in the back-projected ground point --
-    // directly confirmed by the user seeing a curve at the *start* of the
-    // local path. Excluding world_bin_near_margin_ nearest valid bins from
-    // world accumulation only (never the local path, which already looks
-    // right on its own) keeps that curve from being baked into the
-    // permanent trail. Deliberately NOT also excluding the farthest bins
-    // (an earlier version of this did) -- the user asked for that reverted,
-    // since 58183c7's original (unrestricted) far end already looked right.
-    std::vector<bool> bin_world_eligible(num_bins, false);
-    {
-      const int near_cutoff = std::min(static_cast<int>(valid_bin_idx.size()), world_bin_near_margin_);
-      for (int i = near_cutoff; i < static_cast<int>(valid_bin_idx.size()); ++i) {
-        bin_world_eligible[valid_bin_idx[i]] = true;
-      }
     }
 
     std::vector<Waypoint> waypoints;
@@ -522,22 +503,9 @@ private:
     }
 
     // Independent of the local per-frame fit above -- the world bins are
-    // populated from the same eligible-bin candidates collected in the main
-    // loop, so this publishes/refines even on frames where the local fit
-    // didn't converge (e.g. too few bins for min_valid_bins_).
+    // populated directly from banded LiDAR points in the main loop, so this
+    // publishes/refines even on frames where the local fit didn't converge.
     if (accumulate_path_ && t_map_base) {
-      for (int b = 0; b < num_bins; ++b) {
-        if (!bin_world_eligible[b]) {
-          continue;
-        }
-        for (const auto & [raw_x, p_map] : bin_world_candidates[b]) {
-          const long long world_key = static_cast<long long>(std::floor((traveled_arclength_ + raw_x) / bin_size_));
-          auto & wb = world_bins_[world_key];
-          wb.x.push_back(p_map.x());
-          wb.y.push_back(p_map.y());
-          wb.z.push_back(p_map.z());
-        }
-      }
       publishAccumulatedPath(mask_msg->header.stamp);
     }
 
@@ -776,7 +744,6 @@ private:
   int max_accumulated_points_;
   std::string accumulated_path_topic_;
   int min_world_bin_samples_;
-  int world_bin_near_margin_;
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
