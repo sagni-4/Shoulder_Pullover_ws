@@ -31,6 +31,7 @@
   <arg name="map_frame" default="map"/>
   <arg name="accumulate_path" default="true" description="Publish a second, persistent map-frame Path built from world-frame LiDAR-sample bins (median of every sample ever observed per bin), instead of only the local ego-relative window that RViz redraws from scratch every frame"/>
   <arg name="min_world_bin_samples" default="20" description="Minimum accumulated raw-point samples (across ALL frames) a world bin needs before it appears in the published path. Higher = smoother (each real-world 1m segment is visible ~50-100+ times as the vehicle approaches, so this converges fast) but a longer lag behind the vehicle before that stretch appears"/>
+  <arg name="world_min_capture_x" default="10.0" description="Only samples captured at this forward distance (m) or beyond are trusted for the accumulated path -- mask_ipm's ground-plane back-projection uses a near-vertical ray at short range, so pixel noise there maps to a large swing in the projected point. This is a systematic bias (every bin passes through short range at some point), not a one-off outlier, which is why a whole established stretch can look shifted rather than just the newest tip. Set equal to x_min to disable."/>
   <arg name="max_accumulated_points" default="2000" description="Caps how many finalized world bins are retained/published (oldest dropped first)"/>
   <arg name="accumulated_path_topic" default="~/shoulder_centerline_path_map"/>
 
@@ -60,6 +61,7 @@
     <param name="map_frame" value="$(var map_frame)"/>
     <param name="accumulate_path" value="$(var accumulate_path)"/>
     <param name="min_world_bin_samples" value="$(var min_world_bin_samples)"/>
+    <param name="world_min_capture_x" value="$(var world_min_capture_x)"/>
     <param name="max_accumulated_points" value="$(var max_accumulated_points)"/>
     <param name="accumulated_path_topic" value="$(var accumulated_path_topic)"/>
   </node>

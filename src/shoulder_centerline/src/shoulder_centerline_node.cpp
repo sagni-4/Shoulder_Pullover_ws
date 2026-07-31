@@ -240,6 +240,19 @@ public:
     min_world_bin_samples_ = declare_parameter<int>("min_world_bin_samples", 20);
     // Caps how many finalized world bins are retained/published (oldest dropped first).
     max_accumulated_points_ = declare_parameter<int>("max_accumulated_points", 2000);
+    // Absolute minimum capture-time forward distance (m) for a sample to be
+    // trusted for world accumulation at all -- independent of which local
+    // bin it currently is. mask_ipm's ground-plane back-projection uses a
+    // near-vertical ray at short range, so small mask-boundary pixel noise
+    // there maps to a disproportionately large swing in the projected
+    // ground point (a documented limitation of monocular IPM, distinct from
+    // the "too few samples yet" issue the local path's own hook comes from).
+    // Since every world bin passes through this same short-range window at
+    // some point as the vehicle approaches it, this isn't a one-off outlier
+    // -- it's a systematic bias that can show up in many consecutive bins,
+    // which is why a whole established stretch of the accumulated path can
+    // look shifted, not just its newest tip. Set to x_min to disable.
+    world_min_capture_x_ = declare_parameter<double>("world_min_capture_x", 10.0);
 
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -447,7 +460,13 @@ private:
           bin_z[b].push_back(p_base.z());
         }
 
-        if (t_map_base) {
+        // World accumulation only trusts samples captured beyond
+        // world_min_capture_x_ -- see the module comment on that parameter
+        // for why this is an *absolute* capture-distance gate, not a
+        // relative "nearest bin this frame" one (a rank-based version of
+        // this was tried and reverted: the bias is tied to genuinely short
+        // range, not to whichever bin happens to rank nearest).
+        if (t_map_base && p_base.x() >= world_min_capture_x_) {
           const Eigen::Vector3d p_map = *t_map_base * p_base;
           const long long world_key =
             static_cast<long long>(std::floor((traveled_arclength_ + p_base.x()) / bin_size_));
@@ -468,7 +487,7 @@ private:
             bin_y[b].push_back(s.y());
             bin_z[b].push_back(0.0);
           }
-          if (t_map_base) {
+          if (t_map_base && s.x() >= world_min_capture_x_) {
             const Eigen::Vector3d p_map = *t_map_base * Eigen::Vector3d(s.x(), s.y(), 0.0);
             const long long world_key =
               static_cast<long long>(std::floor((traveled_arclength_ + s.x()) / bin_size_));
@@ -744,6 +763,7 @@ private:
   int max_accumulated_points_;
   std::string accumulated_path_topic_;
   int min_world_bin_samples_;
+  double world_min_capture_x_;
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
