@@ -237,7 +237,7 @@ public:
     // Minimum accumulated raw-point samples (across all frames) a world bin
     // needs before it's included in the published path -- higher trades a
     // longer lag behind the vehicle for a smoother median.
-    min_world_bin_samples_ = declare_parameter<int>("min_world_bin_samples", 20);
+    min_world_bin_samples_ = declare_parameter<int>("min_world_bin_samples", 44);
     // Caps how many finalized world bins are retained/published (oldest dropped first).
     max_accumulated_points_ = declare_parameter<int>("max_accumulated_points", 2000);
     // Absolute minimum capture-time forward distance (m) for a sample to be

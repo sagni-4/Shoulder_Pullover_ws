@@ -51,7 +51,7 @@
   <arg name="centerline_waypoint_spacing" default="1.0"/>
   <arg name="centerline_smoothing_alpha" default="0.3"/>
   <arg name="centerline_accumulate_path" default="true" description="Also publish a growing map-frame Path (~/shoulder_centerline_path_map), built from world-frame LiDAR-sample bins (median of every sample ever observed per bin), in addition to the local ego-relative window"/>
-  <arg name="centerline_min_world_bin_samples" default="20" description="Raise if the accumulated trail still looks jittery -- trades a longer lag behind the vehicle for a smoother median (each real-world segment is typically sampled 50-100+ times before the vehicle passes it)"/>
+  <arg name="centerline_min_world_bin_samples" default="44" description="Raise if the accumulated trail still looks jittery -- trades a longer lag behind the vehicle for a smoother median (each real-world segment is typically sampled 50-100+ times before the vehicle passes it)"/>
   <arg name="centerline_world_min_capture_x" default="10.0" description="Only samples captured at this forward distance (m) or beyond are trusted for the accumulated path -- fixes a systematic near-range bias that can shift a whole established stretch of the trail, not just its newest tip"/>
 
   <!-- RViz -->
