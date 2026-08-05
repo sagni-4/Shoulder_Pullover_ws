@@ -43,6 +43,9 @@
   <arg name="trajectory_default_object_radius" default="1.0"/>
   <arg name="trajectory_collision_margin" default="1.0"/>
 
+  <arg name="visualization_width" default="3.0" description="Width (m) of the shaded RViz ribbon published on ~/planned_path_marker -- roughly lane-width by default"/>
+  <arg name="visualization_alpha" default="0.6"/>
+
   <node pkg="autoware_shoulder_pullover_manager" exec="shoulder_pullover_manager_node" name="shoulder_pullover_manager" output="screen">
     <param name="centerline_topic" value="$(var centerline_topic)"/>
     <param name="odometry_topic" value="$(var odometry_topic)"/>
@@ -79,5 +82,7 @@
     <param name="trajectory_ego_footprint_radius" value="$(var trajectory_ego_footprint_radius)"/>
     <param name="trajectory_default_object_radius" value="$(var trajectory_default_object_radius)"/>
     <param name="trajectory_collision_margin" value="$(var trajectory_collision_margin)"/>
+    <param name="visualization_width" value="$(var visualization_width)"/>
+    <param name="visualization_alpha" value="$(var visualization_alpha)"/>
   </node>
 </launch>

@@ -13,6 +13,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <tier4_system_msgs/msg/mrm_behavior_status.hpp>
 #include <tier4_system_msgs/srv/operate_mrm.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
 #include <atomic>
 #include <memory>
@@ -110,6 +111,16 @@ private:
 
   void publishStatus();
 
+  /// Builds a solid, translucent yellow ribbon (visualization_msgs::Marker,
+  /// TRIANGLE_LIST) of `visualization_width_` running along `trajectory`,
+  /// deliberately styled to match Autoware's own default RViz config, which
+  /// shades its planned path green -- yellow visually marks this as a
+  /// distinct, non-standard maneuver at a glance. Baked into the message
+  /// itself (fixed color/width) rather than left to per-user RViz display
+  /// configuration, so it looks correct for any viewer without manual setup.
+  [[nodiscard]] visualization_msgs::msg::Marker toRibbonMarker(
+    const autoware_planning_msgs::msg::Trajectory & trajectory) const;
+
   // --- Parameters ---------------------------------------------------------
   GoalScorerParams scorer_params_;
   TrajectoryPlannerParams trajectory_params_;
@@ -123,6 +134,10 @@ private:
   std::string direct_trajectory_output_topic_;  ///< Empty (default) = debug-only, see docs above.
   char keyboard_trigger_key_{'p'};
   bool keyboard_trigger_enabled_{true};
+  double visualization_width_{3.0};   ///< Ribbon width (m) of the RViz shading, roughly lane-width
+                                       ///< by default to visually match Autoware's own planned-path
+                                       ///< shading (see the framework's screenshot reference).
+  double visualization_alpha_{0.6};
 
   // --- Collaborators ---------------------------------------------------
   std::unique_ptr<GoalScorer> goal_scorer_;
@@ -151,6 +166,7 @@ private:
   rclcpp::Publisher<autoware_planning_msgs::msg::Trajectory>::SharedPtr trajectory_debug_pub_;
   rclcpp::Publisher<autoware_planning_msgs::msg::Trajectory>::SharedPtr trajectory_direct_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr planned_path_debug_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr planned_path_marker_pub_;
   rclcpp::TimerBase::SharedPtr poll_timer_;
   rclcpp::TimerBase::SharedPtr status_timer_;
   rclcpp::TimerBase::SharedPtr planning_timer_;

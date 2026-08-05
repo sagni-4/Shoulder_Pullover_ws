@@ -39,6 +39,13 @@ nav_msgs::msg::Path toDebugPath(const Trajectory & trajectory)
   }
   return path;
 }
+
+double yawFromQuaternionLocal(const geometry_msgs::msg::Quaternion & q)
+{
+  const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+  const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+  return std::atan2(siny_cosp, cosy_cosp);
+}
 }  // namespace
 
 PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
@@ -111,6 +118,9 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   direct_trajectory_output_topic_ =
     declare_parameter<std::string>("direct_trajectory_output_topic", "");
 
+  visualization_width_ = declare_parameter<double>("visualization_width", visualization_width_);
+  visualization_alpha_ = declare_parameter<double>("visualization_alpha", visualization_alpha_);
+
   keyboard_trigger_enabled_ = declare_parameter<bool>("keyboard_trigger_enabled", true);
   const std::string trigger_key_param = declare_parameter<std::string>("keyboard_trigger_key", "p");
   keyboard_trigger_key_ = trigger_key_param.empty() ? 'p' : trigger_key_param.front();
@@ -173,6 +183,8 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     create_publisher<Trajectory>("~/planned_trajectory", rclcpp::QoS(1));
   planned_path_debug_pub_ =
     create_publisher<nav_msgs::msg::Path>("~/planned_path_debug", rclcpp::QoS(1));
+  planned_path_marker_pub_ =
+    create_publisher<visualization_msgs::msg::Marker>("~/planned_path_marker", rclcpp::QoS(1));
   if (!direct_trajectory_output_topic_.empty()) {
     trajectory_direct_pub_ =
       create_publisher<Trajectory>(direct_trajectory_output_topic_, rclcpp::QoS(1));
@@ -261,6 +273,71 @@ void PullOverManagerNode::onPollTimer()
 
 void PullOverManagerNode::onStatusTimer() { publishStatus(); }
 
+visualization_msgs::msg::Marker PullOverManagerNode::toRibbonMarker(const Trajectory & trajectory) const
+{
+  visualization_msgs::msg::Marker marker;
+  marker.header = trajectory.header;
+  marker.ns = "pullover_path";
+  marker.id = 0;
+  marker.type = visualization_msgs::msg::Marker::TRIANGLE_LIST;
+  marker.action = visualization_msgs::msg::Marker::ADD;
+  marker.pose.orientation.w = 1.0;
+  marker.scale.x = 1.0;
+  marker.scale.y = 1.0;
+  marker.scale.z = 1.0;
+  marker.color.r = 1.0F;
+  marker.color.g = 1.0F;
+  marker.color.b = 0.0F;
+  marker.color.a = static_cast<float>(visualization_alpha_);
+  // Auto-expires if this node stops publishing (e.g. a crash) instead of
+  // leaving a stale shaded path behind in RViz -- republished well within
+  // this window every planning cycle in normal operation.
+  marker.lifetime = rclcpp::Duration::from_seconds(0.5);
+
+  const double half_width = visualization_width_ / 2.0;
+
+  for (std::size_t i = 0; i + 1 < trajectory.points.size(); ++i) {
+    const auto & p0 = trajectory.points[i].pose;
+    const auto & p1 = trajectory.points[i + 1].pose;
+
+    const double yaw0 = yawFromQuaternionLocal(p0.orientation);
+    const double yaw1 = yawFromQuaternionLocal(p1.orientation);
+    const double nx0 = -std::sin(yaw0);
+    const double ny0 = std::cos(yaw0);
+    const double nx1 = -std::sin(yaw1);
+    const double ny1 = std::cos(yaw1);
+
+    geometry_msgs::msg::Point left0;
+    left0.x = p0.position.x + half_width * nx0;
+    left0.y = p0.position.y + half_width * ny0;
+    left0.z = p0.position.z;
+    geometry_msgs::msg::Point right0;
+    right0.x = p0.position.x - half_width * nx0;
+    right0.y = p0.position.y - half_width * ny0;
+    right0.z = p0.position.z;
+    geometry_msgs::msg::Point left1;
+    left1.x = p1.position.x + half_width * nx1;
+    left1.y = p1.position.y + half_width * ny1;
+    left1.z = p1.position.z;
+    geometry_msgs::msg::Point right1;
+    right1.x = p1.position.x - half_width * nx1;
+    right1.y = p1.position.y - half_width * ny1;
+    right1.z = p1.position.z;
+
+    // Two triangles per segment, consistent winding, forming a solid
+    // quad/ribbon between consecutive trajectory points.
+    marker.points.push_back(left0);
+    marker.points.push_back(right0);
+    marker.points.push_back(left1);
+
+    marker.points.push_back(right0);
+    marker.points.push_back(right1);
+    marker.points.push_back(left1);
+  }
+
+  return marker;
+}
+
 void PullOverManagerNode::publishStatus()
 {
   MrmBehaviorStatus status;
@@ -332,6 +409,7 @@ void PullOverManagerNode::onPlanningTimer()
   consecutive_planning_failures_ = 0;
   trajectory_debug_pub_->publish(*trajectory);
   planned_path_debug_pub_->publish(toDebugPath(*trajectory));
+  planned_path_marker_pub_->publish(toRibbonMarker(*trajectory));
   if (trajectory_direct_pub_) {
     trajectory_direct_pub_->publish(*trajectory);
   }

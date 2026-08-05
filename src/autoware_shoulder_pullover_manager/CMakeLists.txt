@@ -19,6 +19,7 @@ find_package(autoware_common_msgs REQUIRED)
 find_package(autoware_perception_msgs REQUIRED)
 find_package(autoware_planning_msgs REQUIRED)
 find_package(tier4_system_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 add_library(shoulder_pullover_manager_lib
   src/goal_scorer.cpp
@@ -39,6 +40,7 @@ ament_target_dependencies(shoulder_pullover_manager_lib
   autoware_perception_msgs
   autoware_planning_msgs
   tier4_system_msgs
+  visualization_msgs
 )
 
 add_executable(shoulder_pullover_manager_node
