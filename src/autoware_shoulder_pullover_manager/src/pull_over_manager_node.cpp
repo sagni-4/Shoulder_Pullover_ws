@@ -123,6 +123,10 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   arrival_speed_threshold_ = declare_parameter<double>("arrival_speed_threshold", 0.2);
   max_consecutive_planning_failures_ =
     declare_parameter<int>("max_consecutive_planning_failures", 30);
+  deceleration_lookahead_distance_ = declare_parameter<double>(
+    "deceleration_lookahead_distance", deceleration_lookahead_distance_);
+  deceleration_giveup_speed_threshold_ = declare_parameter<double>(
+    "deceleration_giveup_speed_threshold", deceleration_giveup_speed_threshold_);
   // Deliberately empty by default: this node's own trajectory is only ever
   // published on its own namespaced topics unless explicitly pointed at the
   // live control-facing topic. Doing so requires planning_validator's own
@@ -268,6 +272,7 @@ void PullOverManagerNode::onOperateMrm(
     RCLCPP_INFO(get_logger(), "OperateMrm(operate=false) received -- standing down.");
     state_ = ManagerState::kIdle;
     active_goal_.reset();
+    deceleration_goal_.reset();
     response->response.success = true;
     response->response.message = "stood down";
     return;
@@ -363,7 +368,12 @@ void PullOverManagerNode::publishStatus()
                       latest_odometry_ != nullptr;
 
   switch (state_) {
+    case ManagerState::kDecelerating:
     case ManagerState::kOperating:
+      // Both report OPERATING to mrm_handler/the trajectory gate -- from
+      // their perspective the MRM has been engaged and is actively doing
+      // something, whether that is in-lane braking or the curved
+      // maneuver itself (see kDecelerating's docs).
       status.state = MrmBehaviorStatus::OPERATING;
       break;
     default:
@@ -375,7 +385,7 @@ void PullOverManagerNode::publishStatus()
 
 void PullOverManagerNode::onPlanningTimer()
 {
-  if (state_ != ManagerState::kOperating || !active_goal_.has_value()) {
+  if (state_ != ManagerState::kDecelerating && state_ != ManagerState::kOperating) {
     return;
   }
   if (!latest_odometry_) {
@@ -385,6 +395,73 @@ void PullOverManagerNode::onPlanningTimer()
   const auto & ego_pose = latest_odometry_->pose.pose;
   const double ego_speed = std::hypot(
     latest_odometry_->twist.twist.linear.x, latest_odometry_->twist.twist.linear.y);
+
+  if (state_ == ManagerState::kDecelerating) {
+    // Re-check every cycle at the *current* (dropping) speed -- see
+    // kDecelerating's docs for why there is no single fixed "slow enough"
+    // threshold to wait for instead.
+    if (latest_centerline_ && !latest_centerline_->poses.empty()) {
+      const auto goal =
+        goal_scorer_->selectBestGoal(*latest_centerline_, ego_pose, ego_speed);
+      if (goal.has_value()) {
+        RCLCPP_INFO(
+          get_logger(),
+          "Feasible shoulder goal now reachable at %.2f m/s (score=%.3f distance=%.1fm "
+          "maneuver_curvature=%.4f maneuver_initial_jerk=%.3f) -- switching from in-lane "
+          "braking to the pull-over maneuver.",
+          ego_speed, goal->score, goal->distance_from_ego, goal->maneuver_curvature,
+          goal->maneuver_initial_jerk);
+        active_goal_ = goal->pose;
+        deceleration_goal_.reset();
+        consecutive_planning_failures_ = 0;
+        state_ = ManagerState::kOperating;
+        return;  // Let the next cycle (100ms away) build the real pull-over trajectory.
+      }
+    }
+
+    if (ego_speed <= deceleration_giveup_speed_threshold_) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "Decelerated to %.2f m/s with still no feasible shoulder goal within range -- "
+        "giving up (nothing reachable here, not just \"too fast right now\").",
+        ego_speed);
+      state_ = ManagerState::kFailed;
+      deceleration_goal_.reset();
+      return;
+    }
+
+    // Not slow enough yet (or centerline data momentarily unavailable) --
+    // keep braking straight ahead, in-lane, toward the *fixed* goal picked
+    // when kDecelerating began (see deceleration_goal_'s docs for why this
+    // must not be resynthesized from ego's current pose every cycle).
+    // Deliberately reuses PullOverTrajectoryPlanner itself.
+    if (!deceleration_goal_.has_value()) {
+      deceleration_goal_ = buildDecelerationGoal(ego_pose);
+    }
+
+    KinematicState start;
+    start.pose = ego_pose;
+    start.speed = ego_speed;
+
+    std::string failure_reason;
+    const auto trajectory = trajectory_planner_->plan(
+      start, *deceleration_goal_, latest_objects_, now(), &failure_reason);
+    if (!trajectory.has_value()) {
+      RCLCPP_WARN(
+        get_logger(), "No feasible in-lane braking trajectory found this cycle. Last reason: %s",
+        failure_reason.c_str());
+      return;  // Transient; try again next cycle, no consecutive-failure counting here --
+               // this straight-line case is not expected to fail the way a curved
+               // pull-over approach can.
+    }
+    publishTrajectory(*trajectory);
+    return;
+  }
+
+  // state_ == kOperating from here on -- unchanged from before kDecelerating existed.
+  if (!active_goal_.has_value()) {
+    return;
+  }
 
   const double distance_to_goal = std::hypot(
     active_goal_->position.x - ego_pose.position.x, active_goal_->position.y - ego_pose.position.y);
@@ -425,12 +502,27 @@ void PullOverManagerNode::onPlanningTimer()
   }
 
   consecutive_planning_failures_ = 0;
-  trajectory_debug_pub_->publish(*trajectory);
-  planned_path_debug_pub_->publish(toDebugPath(*trajectory));
-  planned_path_marker_pub_->publish(toRibbonMarker(*trajectory));
+  publishTrajectory(*trajectory);
+}
+
+void PullOverManagerNode::publishTrajectory(const Trajectory & trajectory)
+{
+  trajectory_debug_pub_->publish(trajectory);
+  planned_path_debug_pub_->publish(toDebugPath(trajectory));
+  planned_path_marker_pub_->publish(toRibbonMarker(trajectory));
   if (trajectory_direct_pub_) {
-    trajectory_direct_pub_->publish(*trajectory);
+    trajectory_direct_pub_->publish(trajectory);
   }
+}
+
+geometry_msgs::msg::Pose PullOverManagerNode::buildDecelerationGoal(
+  const geometry_msgs::msg::Pose & ego_pose) const
+{
+  const double yaw = yawFromQuaternionLocal(ego_pose.orientation);
+  geometry_msgs::msg::Pose goal = ego_pose;
+  goal.position.x += deceleration_lookahead_distance_ * std::cos(yaw);
+  goal.position.y += deceleration_lookahead_distance_ * std::sin(yaw);
+  return goal;
 }
 
 // --- Core maneuver logic ---------------------------------------------------
@@ -439,7 +531,7 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
 {
   RCLCPP_INFO(get_logger(), "Pull-over trigger received from: %s", trigger_source.c_str());
 
-  if (state_ == ManagerState::kOperating) {
+  if (state_ == ManagerState::kOperating || state_ == ManagerState::kDecelerating) {
     const std::string message = "Ignored: a pull-over maneuver is already in progress.";
     RCLCPP_WARN(get_logger(), "%s", message.c_str());
     return {false, message};
@@ -475,12 +567,16 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
     *latest_centerline_, latest_odometry_->pose.pose, ego_speed);
 
   if (!goal.has_value()) {
+    // Not a refusal -- see kDecelerating's docs for why "no feasible goal at
+    // the current speed" is treated as "not yet", not "never", given
+    // feasibility is speed-dependent (jerk scales with speed cubed) rather
+    // than being about this goal being permanently unreachable.
     const std::string message =
-      "Refused: no feasible shoulder goal found (nothing within range, ahead of ego, past the "
-      "minimum stopping distance, with enough confirmed continuity).";
-    RCLCPP_ERROR(get_logger(), "%s", message.c_str());
-    state_ = ManagerState::kFailed;
-    return {false, message};
+      "No feasible shoulder goal at current speed (" + std::to_string(ego_speed) +
+      " m/s) -- decelerating in-lane until one becomes reachable.";
+    RCLCPP_WARN(get_logger(), "%s", message.c_str());
+    state_ = ManagerState::kDecelerating;
+    return {true, message};
   }
 
   RCLCPP_INFO(

@@ -50,8 +50,23 @@ add_executable(shoulder_pullover_manager_node
 )
 target_link_libraries(shoulder_pullover_manager_node shoulder_pullover_manager_lib)
 
+add_executable(pullover_trajectory_gate_node
+  src/trajectory_gate_node.cpp
+  src/gate_main.cpp
+)
+target_include_directories(pullover_trajectory_gate_node PUBLIC
+  include
+)
+ament_target_dependencies(pullover_trajectory_gate_node
+  rclcpp
+  nav_msgs
+  autoware_planning_msgs
+  tier4_system_msgs
+)
+
 install(TARGETS
   shoulder_pullover_manager_node
+  pullover_trajectory_gate_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(TARGETS

@@ -16,6 +16,8 @@
   <arg name="arrival_distance_threshold" default="1.0" description="Meters from goal to declare the maneuver succeeded"/>
   <arg name="arrival_speed_threshold" default="0.2" description="m/s below which ego is considered stopped for arrival purposes"/>
   <arg name="max_consecutive_planning_failures" default="30" description="Consecutive cycles with no feasible/collision-free trajectory before giving up and reporting failure"/>
+  <arg name="deceleration_lookahead_distance" default="40.0" description="m -- how far ahead (along ego's current heading) the synthetic straight-line in-lane braking goal is placed each cycle when no shoulder goal is feasible yet at the current speed"/>
+  <arg name="deceleration_giveup_speed_threshold" default="0.3" description="m/s -- if ego decelerates to at/below this with still no feasible shoulder goal in range, give up (nothing reachable here, not just too fast right now)"/>
 
   <arg name="direct_trajectory_output_topic" default="" description="DANGER if misused: when non-empty, this node ALSO publishes its planned trajectory directly on this topic name every planning cycle while operating. Only set this to the live control-facing trajectory topic (e.g. /planning/trajectory) if planning_validator's own output has been remapped away from that name first -- otherwise two publishers race on the same topic while the vehicle may be under autonomous control. Leave empty (default) to only publish on this node's own debug topics."/>
 
@@ -67,6 +69,8 @@
     <param name="arrival_distance_threshold" value="$(var arrival_distance_threshold)"/>
     <param name="arrival_speed_threshold" value="$(var arrival_speed_threshold)"/>
     <param name="max_consecutive_planning_failures" value="$(var max_consecutive_planning_failures)"/>
+    <param name="deceleration_lookahead_distance" value="$(var deceleration_lookahead_distance)"/>
+    <param name="deceleration_giveup_speed_threshold" value="$(var deceleration_giveup_speed_threshold)"/>
     <param name="direct_trajectory_output_topic" value="$(var direct_trajectory_output_topic)"/>
     <param name="max_lookahead_distance" value="$(var max_lookahead_distance)"/>
     <param name="comfortable_deceleration" value="$(var comfortable_deceleration)"/>
