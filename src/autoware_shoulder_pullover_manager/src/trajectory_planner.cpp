@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 
 namespace autoware::shoulder_pullover_manager
 {
@@ -164,38 +165,71 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   trajectory.header.frame_id = "map";
 
   const int num_samples = std::max(2, static_cast<int>(std::round(duration / params_.dt)) + 1);
-  trajectory.points.reserve(static_cast<std::size_t>(num_samples));
 
+  // First pass: raw kinematics only. Heading is deliberately NOT derived
+  // from the instantaneous velocity vector here -- atan2(vy, vx) is
+  // numerically unstable at low speed (small floating-point perturbations
+  // swing the angle wildly), and this planner's start boundary condition is
+  // v=0, a=0 (see above), so early samples of a maneuver starting from rest
+  // spend several cycles at near-zero speed. An earlier version thresholded
+  // on speed > 1e-3 m/s and fell back to a constant goal-heading below that
+  // -- which produced a *discontinuous* heading jump exactly at the
+  // threshold crossing, read as a spurious huge curvature spike by
+  // satisfiesKinematicConstraints, and caused every candidate starting near
+  // rest to be rejected. Fixed below by deriving heading from consecutive
+  // *sampled positions* instead (second pass) -- smooth by construction,
+  // no velocity-magnitude threshold involved at all.
+  struct RawSample
+  {
+    double x, y, z, vx, vy, ax, ay, t;
+  };
+  std::vector<RawSample> raw;
+  raw.reserve(static_cast<std::size_t>(num_samples));
   for (int i = 0; i < num_samples; ++i) {
     const double t = std::min(duration, i * params_.dt);
-    const bool is_last = (i == num_samples - 1);
+    raw.push_back(
+      {qx.position(t), qy.position(t), goal_pose.position.z, qx.velocity(t), qy.velocity(t),
+       qx.acceleration(t), qy.acceleration(t), t});
+  }
+
+  trajectory.points.reserve(raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    const bool is_last = (i + 1 == raw.size());
+    const RawSample & s = raw[i];
 
     TrajectoryPoint point;
-    const double x = qx.position(t);
-    const double y = qy.position(t);
-    const double vx = qx.velocity(t);
-    const double vy = qy.velocity(t);
-    const double ax = qx.acceleration(t);
-    const double ay = qy.acceleration(t);
+    point.pose.position.x = s.x;
+    point.pose.position.y = s.y;
+    point.pose.position.z = s.z;  // Ground height interpolated at the goal.
 
-    point.pose.position.x = x;
-    point.pose.position.y = y;
-    point.pose.position.z = goal_pose.position.z;  // Ground height interpolated at the goal.
-
-    const double speed = std::hypot(vx, vy);
-    const double yaw = (speed > 1e-3) ? std::atan2(vy, vx) : goal_yaw;
+    // Heading from the position delta to the next sample -- always
+    // well-defined, never degenerates near zero speed. The last sample has
+    // no "next" point to difference against, so it reuses the previous
+    // point's heading (the final segment's direction) instead.
+    double yaw;
+    if (!is_last) {
+      yaw = std::atan2(raw[i + 1].y - s.y, raw[i + 1].x - s.x);
+    } else {
+      yaw = trajectory.points.empty() ? goal_yaw
+                                       : yawFromQuaternion(trajectory.points.back().pose.orientation);
+    }
     point.pose.orientation = quaternionFromYaw(yaw);
 
+    const double speed = std::hypot(s.vx, s.vy);
     point.longitudinal_velocity_mps = static_cast<float>(is_last ? 0.0 : speed);
     point.lateral_velocity_mps = 0.0F;
-    // Signed tangential acceleration (component of (ax,ay) along heading),
-    // matching TrajectoryPoint's "does not consider direction" convention.
-    point.acceleration_mps2 =
-      static_cast<float>(is_last ? 0.0 : (speed > 1e-3 ? (vx * ax + vy * ay) / speed : 0.0));
+    // Signed tangential acceleration (component of (ax,ay) along velocity
+    // direction), matching TrajectoryPoint's "does not consider direction"
+    // convention. Falls back to 0 at near-zero speed, where "tangential"
+    // is undefined anyway and the true acceleration is dominated by jerk,
+    // not something this scalar field can represent regardless.
+    point.acceleration_mps2 = static_cast<float>(
+      is_last ? 0.0 : (speed > 1e-2 ? (s.vx * s.ax + s.vy * s.ay) / speed : 0.0));
 
-    const auto time_from_start = rclcpp::Duration::from_seconds(t);
+    const auto time_from_start = rclcpp::Duration::from_seconds(s.t);
     point.time_from_start.sec = static_cast<int32_t>(time_from_start.seconds());
-    point.time_from_start.nanosec = static_cast<uint32_t>(time_from_start.nanoseconds() % 1000000000LL);
+    point.time_from_start.nanosec =
+      static_cast<uint32_t>(time_from_start.nanoseconds() % 1000000000LL);
 
     trajectory.points.push_back(point);
   }
@@ -203,53 +237,97 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   return trajectory;
 }
 
-bool PullOverTrajectoryPlanner::satisfiesKinematicConstraints(const Trajectory & trajectory) const
+bool PullOverTrajectoryPlanner::satisfiesKinematicConstraints(
+  const Trajectory & trajectory, std::string * failure_reason) const
 {
   double previous_lateral_accel = 0.0;
   bool have_previous = false;
 
   for (std::size_t i = 0; i + 1 < trajectory.points.size(); ++i) {
-    const auto & p0 = trajectory.points[i].pose.position;
-    const auto & p1 = trajectory.points[i + 1].pose.position;
-    const double dx = p1.x - p0.x;
-    const double dy = p1.y - p0.y;
-    const double segment_length = std::hypot(dx, dy);
-
-    // Curvature via heading change over segment length -- consistent with
-    // planning_validator's own finite-difference approach (see report).
-    const double yaw0 = yawFromQuaternion(trajectory.points[i].pose.orientation);
-    const double yaw1 = yawFromQuaternion(trajectory.points[i + 1].pose.orientation);
-    double dyaw = yaw1 - yaw0;
-    while (dyaw > M_PI) dyaw -= 2.0 * M_PI;
-    while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-
-    if (segment_length < 1e-3) {
-      continue;  // Stationary/near-stationary segment -- no meaningful curvature here.
-    }
-    const double curvature = dyaw / segment_length;
-    if (std::abs(curvature) > params_.max_curvature) {
-      return false;
-    }
-
     const double speed = trajectory.points[i].longitudinal_velocity_mps;
-    const double lateral_accel = speed * speed * curvature;
-    if (std::abs(lateral_accel) > params_.max_lateral_accel) {
-      return false;
-    }
 
-    if (have_previous) {
-      const double lateral_jerk = (lateral_accel - previous_lateral_accel) / params_.dt;
-      if (std::abs(lateral_jerk) > params_.max_lateral_jerk) {
-        return false;
+    // Below this speed, path curvature computed from finite differences
+    // (dyaw/segment_length) is numerically ill-conditioned -- segment_length
+    // itself shrinks toward zero near the end of any stopping maneuver, so
+    // even a physically harmless heading adjustment reads as enormous
+    // curvature purely from dividing by a near-zero distance. A
+    // near-stationary vehicle can point its wheels sharply with zero real
+    // dynamic risk (unlike at speed, where the same geometric curvature
+    // really would be dangerous), so this is a deliberate physical gate,
+    // not a loophole: skip curvature/lateral-accel/lateral-jerk here, but
+    // still fall through to the longitudinal-accel check below, which
+    // remains meaningful regardless of speed.
+    if (speed >= params_.min_speed_for_curvature_check) {
+      const auto & p0 = trajectory.points[i].pose.position;
+      const auto & p1 = trajectory.points[i + 1].pose.position;
+      const double segment_length = std::hypot(p1.x - p0.x, p1.y - p0.y);
+
+      // Curvature via heading change over segment length -- consistent with
+      // planning_validator's own finite-difference approach (see report).
+      const double yaw0 = yawFromQuaternion(trajectory.points[i].pose.orientation);
+      const double yaw1 = yawFromQuaternion(trajectory.points[i + 1].pose.orientation);
+      double dyaw = yaw1 - yaw0;
+      while (dyaw > M_PI) dyaw -= 2.0 * M_PI;
+      while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
+
+      if (segment_length >= 1e-3) {
+        const double curvature = dyaw / segment_length;
+        if (std::abs(curvature) > params_.max_curvature) {
+          if (failure_reason) {
+            std::ostringstream oss;
+            oss << "curvature " << curvature << " 1/m exceeds max " << params_.max_curvature
+                << " 1/m at point " << i << " (speed=" << speed << " m/s)";
+            *failure_reason = oss.str();
+          }
+          return false;
+        }
+
+        const double lateral_accel = speed * speed * curvature;
+        if (std::abs(lateral_accel) > params_.max_lateral_accel) {
+          if (failure_reason) {
+            std::ostringstream oss;
+            oss << "lateral accel " << lateral_accel << " m/s^2 exceeds max "
+                << params_.max_lateral_accel << " m/s^2 at point " << i << " (speed=" << speed
+                << " m/s)";
+            *failure_reason = oss.str();
+          }
+          return false;
+        }
+
+        if (have_previous) {
+          const double lateral_jerk = (lateral_accel - previous_lateral_accel) / params_.dt;
+          if (std::abs(lateral_jerk) > params_.max_lateral_jerk) {
+            if (failure_reason) {
+              std::ostringstream oss;
+              oss << "lateral jerk " << lateral_jerk << " m/s^3 exceeds max "
+                  << params_.max_lateral_jerk << " m/s^3 at point " << i;
+              *failure_reason = oss.str();
+            }
+            return false;
+          }
+        }
+        previous_lateral_accel = lateral_accel;
+        have_previous = true;
       }
+    } else {
+      // Below the speed gate: don't carry a stale lateral_accel across the
+      // gap into whatever high-speed segment might follow (e.g. if the
+      // trajectory somehow re-accelerates) -- the jerk check should not
+      // compare across a skipped region.
+      have_previous = false;
     }
-    previous_lateral_accel = lateral_accel;
-    have_previous = true;
 
     const double longitudinal_accel = trajectory.points[i].acceleration_mps2;
     if (
       longitudinal_accel > params_.max_longitudinal_accel ||
       longitudinal_accel < params_.min_longitudinal_accel) {
+      if (failure_reason) {
+        std::ostringstream oss;
+        oss << "longitudinal accel " << longitudinal_accel << " m/s^2 outside ["
+            << params_.min_longitudinal_accel << ", " << params_.max_longitudinal_accel
+            << "] at point " << i;
+        *failure_reason = oss.str();
+      }
       return false;
     }
   }
@@ -258,7 +336,7 @@ bool PullOverTrajectoryPlanner::satisfiesKinematicConstraints(const Trajectory &
 
 bool PullOverTrajectoryPlanner::isCollisionFree(
   const Trajectory & trajectory, const PredictedObjects & objects,
-  const rclcpp::Time & trajectory_start_time) const
+  const rclcpp::Time & trajectory_start_time, std::string * failure_reason) const
 {
   for (const PredictedObject & object : objects.objects) {
     const double radius = objectRadius(object.shape, params_.default_object_radius);
@@ -291,6 +369,13 @@ bool PullOverTrajectoryPlanner::isCollisionFree(
         trajectory_point.pose.position.x - object_position.x,
         trajectory_point.pose.position.y - object_position.y);
       if (distance < required_clearance) {
+        if (failure_reason) {
+          std::ostringstream oss;
+          oss << "would come within " << distance << "m of a tracked object (needs "
+              << required_clearance << "m clearance: ego_radius=" << params_.ego_footprint_radius
+              << " + object_radius=" << radius << " + margin=" << params_.collision_margin << ")";
+          *failure_reason = oss.str();
+        }
         return false;
       }
     }
@@ -301,7 +386,7 @@ bool PullOverTrajectoryPlanner::isCollisionFree(
 
 std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
-  const PredictedObjects & objects, const rclcpp::Time & stamp) const
+  const PredictedObjects & objects, const rclcpp::Time & stamp, std::string * failure_reason) const
 {
   const double distance = std::hypot(
     goal_pose.position.x - start.pose.position.x, goal_pose.position.y - start.pose.position.y);
@@ -318,10 +403,21 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
     if (!candidate.has_value()) {
       continue;
     }
-    if (!satisfiesKinematicConstraints(*candidate)) {
+    std::string reason;
+    if (!satisfiesKinematicConstraints(*candidate, &reason)) {
+      if (failure_reason) {
+        std::ostringstream oss;
+        oss << "duration=" << duration << "s: " << reason;
+        *failure_reason = oss.str();
+      }
       continue;
     }
-    if (!isCollisionFree(*candidate, objects, stamp)) {
+    if (!isCollisionFree(*candidate, objects, stamp, &reason)) {
+      if (failure_reason) {
+        std::ostringstream oss;
+        oss << "duration=" << duration << "s: " << reason;
+        *failure_reason = oss.str();
+      }
       continue;
     }
     return candidate;

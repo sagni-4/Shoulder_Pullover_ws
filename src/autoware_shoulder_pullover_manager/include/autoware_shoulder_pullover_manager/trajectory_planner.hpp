@@ -6,6 +6,7 @@
 #include <rclcpp/time.hpp>
 
 #include <optional>
+#include <string>
 
 namespace autoware::shoulder_pullover_manager
 {
@@ -33,7 +34,27 @@ struct TrajectoryPlannerParams
                                          ///< heading boundary condition well-defined near the
                                          ///< stop; the actual last sample is force-zeroed.
 
-  double max_curvature{0.5};          ///< 1/m. Conservative vs. validator's ~1.0.
+  double max_curvature{0.8};          ///< 1/m. Conservative vs. validator's ~1.0 (live-tested: a
+                                       ///< low-speed final heading adjustment legitimately needs
+                                       ///< ~0.53-0.54 1/m -- physically fine, since the
+                                       ///< speed-squared lateral-accel check already bounds the
+                                       ///< actually-dangerous quantity separately; 0.5 was too
+                                       ///< tight a standalone geometric cap for that case, 0.8
+                                       ///< still leaves real margin under validator's ~1.0).
+  double min_speed_for_curvature_check{0.15};  ///< m/s. Below this speed, curvature/lateral-accel/
+                                               ///< lateral-jerk checks are skipped entirely rather
+                                               ///< than evaluated -- live-tested finding:
+                                               ///< curvature = d(heading)/segment_length blows up
+                                               ///< near the very end of any stopping maneuver as
+                                               ///< segment_length -> 0, even for a physically
+                                               ///< harmless heading adjustment. A near-stationary
+                                               ///< vehicle can point its wheels sharply with zero
+                                               ///< real dynamic risk (unlike at speed, where the
+                                               ///< same geometric curvature really would be
+                                               ///< dangerous) -- raising the raw threshold instead
+                                               ///< of gating by speed was tried first and only
+                                               ///< pushed the same division-by-near-zero artifact
+                                               ///< to a later sample, not fixed it.
   double max_lateral_accel{2.5};      ///< m/s^2. Conservative vs. validator's 9.8.
   double max_lateral_jerk{3.0};       ///< m/s^3. Conservative vs. validator's 7.0.
   double max_longitudinal_accel{1.5};   ///< m/s^2.
@@ -87,10 +108,16 @@ public:
   /// trajectory header's stamp and the time-zero reference for both the
   /// output trajectory's `time_from_start` fields and for aligning against
   /// `objects`' predicted-path time steps.
+  ///
+  /// If `failure_reason` is non-null and no candidate succeeds, it is set
+  /// to a human-readable explanation of why the *last* tried candidate was
+  /// rejected (e.g. which constraint, by how much, or which object it
+  /// would have collided with) -- callers should log this rather than
+  /// guess at the cause.
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> plan(
     const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
-    const autoware_perception_msgs::msg::PredictedObjects & objects,
-    const rclcpp::Time & stamp) const;
+    const autoware_perception_msgs::msg::PredictedObjects & objects, const rclcpp::Time & stamp,
+    std::string * failure_reason = nullptr) const;
 
 private:
   /// Coefficients of a scalar quintic q(t) = c0 + c1 t + c2 t^2 + c3 t^3 +
@@ -114,12 +141,13 @@ private:
     const rclcpp::Time & stamp) const;
 
   [[nodiscard]] bool satisfiesKinematicConstraints(
-    const autoware_planning_msgs::msg::Trajectory & trajectory) const;
+    const autoware_planning_msgs::msg::Trajectory & trajectory,
+    std::string * failure_reason = nullptr) const;
 
   [[nodiscard]] bool isCollisionFree(
     const autoware_planning_msgs::msg::Trajectory & trajectory,
     const autoware_perception_msgs::msg::PredictedObjects & objects,
-    const rclcpp::Time & trajectory_start_time) const;
+    const rclcpp::Time & trajectory_start_time, std::string * failure_reason = nullptr) const;
 
   TrajectoryPlannerParams params_;
 };

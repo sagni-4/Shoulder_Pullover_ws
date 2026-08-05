@@ -34,7 +34,8 @@
   <arg name="trajectory_max_duration" default="15.0"/>
   <arg name="trajectory_duration_step" default="1.0"/>
   <arg name="trajectory_terminal_approach_speed" default="0.3"/>
-  <arg name="trajectory_max_curvature" default="0.5" description="1/m -- conservative vs. planning_validator's own ~1.0 hard limit"/>
+  <arg name="trajectory_max_curvature" default="0.8" description="1/m -- conservative vs. planning_validator's own ~1.0 hard limit"/>
+  <arg name="trajectory_min_speed_for_curvature_check" default="0.15" description="m/s -- below this speed, curvature/lateral-accel/lateral-jerk checks are skipped (numerically ill-conditioned near a stop; a near-stationary vehicle can point its wheels sharply with zero real risk)"/>
   <arg name="trajectory_max_lateral_accel" default="2.5" description="m/s^2 -- conservative vs. planning_validator's 9.8 hard limit"/>
   <arg name="trajectory_max_lateral_jerk" default="3.0" description="m/s^3 -- conservative vs. planning_validator's 7.0 hard limit"/>
   <arg name="trajectory_max_longitudinal_accel" default="1.5"/>
@@ -75,6 +76,7 @@
     <param name="trajectory_duration_step" value="$(var trajectory_duration_step)"/>
     <param name="trajectory_terminal_approach_speed" value="$(var trajectory_terminal_approach_speed)"/>
     <param name="trajectory_max_curvature" value="$(var trajectory_max_curvature)"/>
+    <param name="trajectory_min_speed_for_curvature_check" value="$(var trajectory_min_speed_for_curvature_check)"/>
     <param name="trajectory_max_lateral_accel" value="$(var trajectory_max_lateral_accel)"/>
     <param name="trajectory_max_lateral_jerk" value="$(var trajectory_max_lateral_jerk)"/>
     <param name="trajectory_max_longitudinal_accel" value="$(var trajectory_max_longitudinal_accel)"/>

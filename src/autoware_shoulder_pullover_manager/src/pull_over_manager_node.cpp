@@ -83,6 +83,8 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     "trajectory_terminal_approach_speed", trajectory_params_.terminal_approach_speed);
   trajectory_params_.max_curvature =
     declare_parameter<double>("trajectory_max_curvature", trajectory_params_.max_curvature);
+  trajectory_params_.min_speed_for_curvature_check = declare_parameter<double>(
+    "trajectory_min_speed_for_curvature_check", trajectory_params_.min_speed_for_curvature_check);
   trajectory_params_.max_lateral_accel = declare_parameter<double>(
     "trajectory_max_lateral_accel", trajectory_params_.max_lateral_accel);
   trajectory_params_.max_lateral_jerk =
@@ -386,14 +388,16 @@ void PullOverManagerNode::onPlanningTimer()
   start.pose = ego_pose;
   start.speed = ego_speed;
 
+  std::string failure_reason;
   const auto trajectory =
-    trajectory_planner_->plan(start, *active_goal_, latest_objects_, now());
+    trajectory_planner_->plan(start, *active_goal_, latest_objects_, now(), &failure_reason);
 
   if (!trajectory.has_value()) {
     ++consecutive_planning_failures_;
     RCLCPP_WARN(
-      get_logger(), "No feasible/collision-free trajectory found this cycle (%d/%d consecutive).",
-      consecutive_planning_failures_, max_consecutive_planning_failures_);
+      get_logger(),
+      "No feasible/collision-free trajectory found this cycle (%d/%d consecutive). Last reason: %s",
+      consecutive_planning_failures_, max_consecutive_planning_failures_, failure_reason.c_str());
     if (consecutive_planning_failures_ >= max_consecutive_planning_failures_) {
       RCLCPP_ERROR(
         get_logger(),
