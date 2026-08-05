@@ -1,0 +1,8 @@
+build/
+install/
+log/
+.venv/
+*.aux
+*.log
+*.out
+*.toc

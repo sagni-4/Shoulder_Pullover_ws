@@ -1,0 +1,838 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{longtable}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\pkg}[1]{\texttt{#1}}
+
+\title{Shoulder-Targeted Pull-Over as a Minimum Risk Maneuver in Autoware:\\
+Architecture Study, Extension Design, and a Constrained\\
+Classical Trajectory-Generation Framework}
+\author{Autoware + CARLA Shoulder Detection Project \\ \small Framework-phase report --- risk/uncertainty integration deferred to a follow-up phase}
+\date{2026-08-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Introduction and Scope}
+
+\subsection{Motivation}
+The project has, to date, produced a working shoulder \emph{perception} pipeline: a DINOv2-based
+semantic segmentation node (\pkg{shoulder\_detection\_ros}) that classifies the drivable shoulder
+in the front camera image, and a LiDAR-camera fusion node (\pkg{shoulder\_centerline}) that grounds
+that 2D mask into a smooth, ego-relative sequence of 3D waypoints running down the middle of the
+shoulder. Both are stable and considered ``good enough for now'' by the project (see the
+\pkg{shoulder\_detection\_ws} git history, commit \code{0f2a02b} and earlier).
+
+The next objective is to \emph{consume} that centerline for an actual safety function: when
+Autoware's Minimum Risk Maneuver (MRM) system determines the vehicle can no longer continue its
+normal Dynamic Driving Task (DDT), instead of the two behaviors Autoware currently ships
+(decelerate to a stop \emph{in the current lane}, either comfortably or in an emergency), the
+vehicle should be able to change lanes -- from whatever lane it currently occupies -- toward the
+shoulder, and park at a lateral offset chosen from the live centerline, without colliding with
+surrounding traffic.
+
+This document is the output of a dedicated research phase: (1) a structural study of the relevant
+parts of Autoware Universe (behavior planning, MRM/command-mode arbitration, and the
+control/validation stack) carried out directly against this project's pinned checkout under
+\code{\textasciitilde/autoware/src/universe/autoware\_universe}; (2) a literature review restricted
+to IEEE-venue and otherwise high-credibility sources (no MDPI, per this project's standing
+citation policy); and (3) a resulting architecture and mathematical framework for a new,
+Autoware-plugin-based pull-over-to-shoulder MRM.
+
+\subsection{Explicit Scope Boundary}
+Per direction, this phase targets the \emph{classical} formulation only: a deterministic,
+constrained trajectory-generation and lane-sequencing framework built from the same primitives
+Autoware's own planner/controller stack already uses (Frenet-frame polynomial trajectories,
+lanelet-graph routing, MPC/PID tracking). Probabilistic risk and uncertainty modeling --
+quantifying \emph{how} confident the shoulder detector is at a given point, or reasoning about
+occluded/unseen hazards -- is explicitly deferred to a follow-up phase (\S\ref{sec:phase2}), by
+design: every scoring and constraint term introduced here is structured so that a scalar value
+today can be replaced by a distribution parameter later without changing the surrounding
+architecture.
+
+\subsection{Document Outline}
+\S\ref{sec:standards} fixes terminology against the relevant standards.
+\S\ref{sec:relatedwork} reviews the literature.
+\S\ref{sec:autoware} reports the architecture study findings.
+\S\ref{sec:workspace} makes and justifies the workspace-placement decision.
+\S\ref{sec:framework} lays out the proposed extension architecture.
+\S\ref{sec:math} gives the mathematical formulation.
+\S\ref{sec:critique} is a self-directed adversarial review, anticipating the objections a
+methods-track reviewer at a top venue would raise.
+\S\ref{sec:phase2} previews the risk/uncertainty follow-up.
+\S\ref{sec:limitations} and \S\ref{sec:conclusion} close the document.
+
+\section{Standards and Terminology}
+\label{sec:standards}
+
+Two standards anchor the vocabulary used throughout this document:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{SAE J3016} (\emph{Taxonomy and Definitions for Terms Related to Driving Automation
+  Systems for On-Road Motor Vehicles}, SAE International) defines the \emph{Dynamic Driving Task
+  (DDT)}, \emph{DDT fallback}, and the levels of driving automation. An MRM is, in this taxonomy,
+  the mechanism by which an ADS-equipped vehicle performs DDT fallback when the ADS can no longer
+  operate the vehicle within its Operational Design Domain (ODD).
+  \item \textbf{ISO 23793-1:2020}, \emph{Intelligent transport systems -- Minimal risk manoeuvre
+  (MRM) for automated driving -- Part 1: Framework, terms and definitions}
+  \cite{iso23793}, is the dedicated MRM standard. It defines the \emph{minimal risk condition} as
+  the stable, low-risk operating condition an ADS reaches at the end of an MRM, and explicitly
+  contemplates multiple MRM strategies (in-lane stop being only one), which is the standards-level
+  hook that justifies treating ``pull over onto the shoulder'' as a legitimate, standard-anticipated
+  MRM rather than a bespoke deviation from convention.
+\end{itemize}
+
+Autoware's own code reflects this distinction directly: its MRM state machine already carries
+three named strategies -- \code{comfortable\_stop}, \code{emergency\_stop}, and \code{pull\_over}
+-- as first-class members of an enum (\S\ref{sec:mrm}), even though, as this study found, only the
+first two currently have any behavior wired to them.
+
+\section{Related Work}
+\label{sec:relatedwork}
+
+The literature search targeted IEEE Xplore, IEEE Transactions/Journals, and IEEE conference
+proceedings (ICRA, IROS, ITSC, DSN, DSN-W); MDPI results that surfaced in every query (e.g.\ an MRM
+survey in \emph{Vehicles} and a fallback-strategy paper in \emph{Machines}) were deliberately
+excluded per the project's standing no-MDPI policy, even where topically close, and are not cited
+here.
+
+\subsection{Controllability and Design of Minimal Risk Maneuvers}
+Vu et al.\ \cite{vu2023mrm} report a driving-simulator study (35 participants) directly comparing
+MRM strategies for controllability by human occupants during hand-back/failure transitions. Their
+central finding -- that \emph{a lane change coupled with a standstill on the shoulder lane} was
+rated the most controllable strategy, ahead of an in-lane stop -- is the closest thing in the
+literature to a direct empirical justification for this project's premise: shoulder pull-over is
+not merely a nicety, it is the human-factors-preferred MRM outcome when it is geometrically
+available.
+
+\subsection{Emergency and Pull-Over Trajectory Generation}
+Lee et al.\ \cite{lee2022pullover} (IEEE Access) present an emergency pull-over algorithm for
+Level-4 AVs built on model-free adaptive feedback control with online sensitivity estimation and a
+learning-based gain adaptation layer, targeting exactly the ``bring the vehicle to a controlled
+stop outside the travel lane after a fault'' problem. It is evidence that pull-over-as-MRM is an
+active, IEEE-published research target, and its use of an adaptive/learning correction layer on
+top of a classical feedback controller is a useful precedent for how this project's Phase~2
+uncertainty layer could sit on top of the classical controller retained here.
+
+\subsection{Optimal Trajectory Generation in the Frenet Frame}
+Werling et al.\ \cite{werling2010frenet,werling2011manifolds} introduced the now-standard
+approach of decoupling planning into independent longitudinal and lateral 1-D problems in a
+road-aligned (Frenet) frame, each solved in closed form as a quintic (position-to-position) or
+quartic (velocity-keeping) polynomial minimizing a jerk-and-time cost functional, followed by
+re-projection to Cartesian space and a cheap feasibility/collision filter over a sampled family of
+candidates. This is the exact structure adopted for the trajectory layer of the proposed framework
+(\S\ref{sec:math}), both because it is the field's reference method for structured-road maneuver
+generation and because Autoware's own \pkg{autoware\_behavior\_path\_goal\_planner\_module} already
+uses geometrically simpler variants of the same shift/arc idea for its existing pull-over paths
+-- adopting the full Frenet-polynomial form is a principled generalization of what is already
+running in this codebase, not a foreign import.
+
+\subsection{Contingency and Risk-Aware Planning}
+Two recent IEEE-Transactions papers define the state of the art this project's Phase~2 will need to
+engage with. Lin et al.\ \cite{lin2025contingency} formulate contingency-aware spatiotemporal
+trajectory optimization that maintains a nominal and a fallback trajectory simultaneously so that a
+late-revealed hazard does not force an infeasible last-instant maneuver. Yang et al.\
+\cite{yang2025reachable} give a non-conservative contingency-planning method using
+online-learned, reachable-set-based barrier constraints, solved via consensus ADMM, that avoids the
+classic over-conservatism of worst-case reachability while retaining a formal safety argument.
+Both are directly relevant to a future version of the shoulder-goal scoring function in
+\S\ref{sec:math_goal}, which today uses point estimates but is structured to accept exactly this
+kind of reachable-set or contingency-trajectory reasoning later.
+
+\subsection{Formal Safety Framing}
+Shalev-Shwartz, Shammah, and Shashua's Responsibility-Sensitive Safety (RSS) model
+\cite{shalevshwartz2017rss} is cited here as the SOA formal framework for interpretable,
+provable-by-construction safety envelopes (longitudinal/lateral safe-distance rules derived from
+worst-case Newtonian bounds on other agents), and is noted because Autoware's own
+\pkg{path\_safety\_checker} utilities -- reused directly by \pkg{goal\_planner},
+\pkg{start\_planner}, and (per \S\ref{sec:autoware}) available to a new pull-over module for free
+-- already implement an RSS-style safety check (\code{checkSafetyWithRSS}, see
+\S\ref{sec:goalplanner}). This is flagged as an arXiv/industry preprint rather than a peer-reviewed
+IEEE venue, included as foundational SOA context precisely because it is the framework the
+codebase itself already implements, not as a substitute for a peer-reviewed citation.
+
+\subsection{Map Representation}
+Poggenhans et al.\ \cite{poggenhans2018lanelet2} introduce Lanelet2, the HD-map framework Autoware
+uses throughout its routing and behavior-planning stack, including the \code{road\_shoulder}
+lanelet subtype that \pkg{goal\_planner} already queries. Any new module that reasons about
+``which lane is adjacent to the shoulder'' or ``how many lane changes separate the current lane
+from the shoulder'' is, by construction, reasoning over this same Lanelet2 routing graph.
+
+\section{Autoware Architecture Study}
+\label{sec:autoware}
+
+This section reports the findings of a direct source-level study of the project's pinned Autoware
+checkout (paths rooted at \code{src/universe/autoware\_universe/}), covering the three subsystems a
+custom pull-over-to-shoulder MRM must interoperate with: the behavior-path-planning plugin system
+and its existing pull-over/pull-out modules, the MRM/command-mode arbitration pipeline, and the
+control/validation contract a generated trajectory must satisfy.
+
+\subsection{The Behavior Path Planner Plugin System}
+\label{sec:goalplanner}
+
+Autoware's \pkg{behavior\_path\_planner} is a genuine runtime plugin host, not a fixed pipeline.
+Each maneuver (\emph{scene module}, e.g.\ lane change, avoidance, goal\_planner) is a
+\code{pluginlib} class loaded by fully-qualified name:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item A module's \emph{manager} subclasses \code{SceneModuleManagerInterface}
+  (\code{autoware\_behavior\_path\_planner\_common/.../scene\_module\_manager\_interface.hpp}),
+  implementing \code{init()}, \code{createNewSceneModuleInstance()},
+  \code{updateModuleParams()}, and simultaneous-execution predicates.
+  \item The module logic itself derives from \code{SceneModuleInterface}
+  (same package, \code{scene\_module\_interface.hpp}), whose key hooks are
+  \code{isExecutionRequested()}, \code{isExecutionReady()}, \code{updateData()},
+  \code{onEntry()}/\code{onExit()}, \code{plan()}, \code{planWaitingApproval()},
+  \code{planCandidate()}, and the state-machine exit predicates
+  \code{canTransitSuccessState()}/\code{canTransitFailureState()}.
+  \item Registration is declared in a package-root \code{plugins.xml}
+  (e.g.\ \pkg{autoware\_behavior\_path\_goal\_planner\_module/plugins.xml}), and the manager node
+  loads modules named in the \code{launch\_modules} ROS parameter, itself assembled by the launch
+  tree under \pkg{tier4\_planning\_launch}.
+  \item Scheduling and simultaneous-execution priority across modules is config-driven via
+  \emph{slots} in \pkg{autoware\_behavior\_path\_planner/config/scene\_module\_manager.param.yaml};
+  \pkg{goal\_planner} today sits in a slot ordered after \pkg{lane\_change}, which is exactly the
+  precedent a new shoulder-pull-over module would follow.
+\end{itemize}
+
+\textbf{Consequence:} a new maneuver can be added as a fully independent sibling package -- a new
+pluginlib class, a \code{plugins.xml} entry, and a slot-config addition -- with \emph{zero edits to
+core Autoware C++.} This is not a hypothetical; it is exactly how \pkg{goal\_planner} and
+\pkg{start\_planner} themselves are wired in, and it is the mechanism this project's new module will
+use.
+
+\subsubsection{How goal\_planner Already Solves an Adjacent Problem}
+\pkg{autoware\_behavior\_path\_goal\_planner\_module} (\textasciitilde9{,}700 LOC across 34 files)
+is the closest existing analog and a substantial source of reusable machinery:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item It generates candidate pull-over paths using five interchangeable planner types --
+  \code{SHIFT}, \code{BEZIER}, \code{ARC\_FORWARD}, \code{ARC\_BACKWARD}, and \code{FREESPACE}
+  (the last delegating to \pkg{autoware\_freespace\_planning\_algorithms} for obstructed spots) --
+  each a concrete class under \code{pull\_over\_planner/}.
+  \item Candidate \emph{goal poses} are sampled along the target lane by \code{goal\_searcher.cpp};
+  the target lane is explicitly permitted to be a \code{road\_shoulder}-subtype lanelet
+  (\code{route\_handler.cpp}'s \code{isShoulderLanelet()} checks the Lanelet2
+  \code{Subtype} attribute directly), and \pkg{goal\_planner} calls
+  \code{getShoulderLaneletSequence()} to build the parking-maneuver lane sequence.
+  \item Candidates are filtered/ranked by remaining-distance feasibility
+  (\code{hasEnoughDistance()}) and a genuine safety check, \code{isSafePath()}, that runs either an
+  RSS-style check (\code{checkSafetyWithRSS()}) or an integral predicted-occupancy-polygon check
+  against tracked dynamic objects, using the same \pkg{path\_safety\_checker} utilities shared with
+  \pkg{lane\_change} and \pkg{avoidance}.
+  \item \textbf{Critical limitation}: \pkg{goal\_planner}'s own candidate search stays within the
+  current lane sequence plus its \emph{immediate} left/right neighbor. It does not itself induce a
+  multi-lane-change maneuver; \code{isExecutionRequested()} requires the goal to already be
+  reachable from the current lane within a bounded request length. Reaching a shoulder that is two
+  or more lanes away therefore requires the separate \pkg{lane\_change} module to run first, with
+  the two coordinated purely through the slot/priority mechanism above -- there is no bespoke
+  multi-module orchestration logic to reverse-engineer; the existing scheduler already handles it.
+  \item \textbf{Output contract}: every module's \code{plan()} returns a \code{BehaviorModuleOutput}
+  containing a \code{PathWithLaneId} (points tagged with lanelet IDs, for downstream
+  velocity/right-of-way lookups), a \code{DrivableAreaInfo}, and an optional
+  \code{modified\_goal}. This is what any new module must populate correctly to remain compatible
+  with \pkg{behavior\_velocity\_planner} and the trajectory-generation stages further downstream.
+  \item \textbf{Triggering is geometry-driven, not service-driven}: \code{isExecutionRequested()}
+  activates purely because the \emph{route's own goal pose} falls in/near the shoulder, gated by an
+  \code{allow\_goal\_modification} flag carried on the route itself. There is no dedicated runtime
+  API to hand \pkg{goal\_planner} an arbitrary pose mid-drive. The idiomatic way to trigger it
+  dynamically is therefore \emph{upstream}, at the routing layer: call
+  \pkg{autoware\_mission\_planner\_universe}'s AD API service (\code{SetRoutePoints} /
+  \code{SetWaypointRoute}) with a new goal at the desired shoulder coordinate and
+  \code{allow\_goal\_modification=true}; \code{route\_handler} then updates, and
+  \code{isExecutionRequested()} naturally goes true on the next planning cycle. This is the
+  mechanism the proposed framework uses (\S\ref{sec:framework}) -- no hand-written activation logic
+  is needed.
+\end{itemize}
+
+Given this structure, a new shoulder-specific module can realistically reuse an estimated 60--70\%
+of \pkg{goal\_planner}'s scaffolding (manager/plugin boilerplate, the safety-check call chain, and
+shift/arc path-shape primitives), writing fresh only the shoulder-centerline-specific goal-scoring
+logic (\S\ref{sec:math_goal}) and any bespoke entry-path shaping the live centerline demands.
+
+\subsection{MRM and Command-Mode Arbitration}
+\label{sec:mrm}
+
+The checkout contains \emph{two parallel, coexisting} architectures for turning ``something is
+wrong'' into ``an MRM behavior executes,'' both fed from the same underlying diagnostic-graph fault
+classification.
+
+\subsubsection{Legacy Path: \pkg{autoware\_mrm\_handler}}
+\pkg{autoware\_diagnostic\_graph\_aggregator} republishes fault state as
+\code{tier4\_system\_msgs/OperationModeAvailability} (booleans: \code{stop},
+\code{autonomous}, \code{emergency\_stop}, \code{comfortable\_stop}, \code{pull\_over}).
+\pkg{autoware\_mrm\_handler} (631+179 LOC) subscribes to this on a 10\,Hz timer, runs an internal
+MRM state machine, and dispatches the chosen behavior via
+\code{tier4\_system\_msgs::srv::OperateMrm} service calls to
+\code{\textasciitilde/output/mrm/\{pull\_over,comfortable\_stop,emergency\_stop\}/operate}. Result
+state is published on \code{/system/fail\_safe/mrm\_state}
+(\code{autoware\_adapi\_v1\_msgs::msg::MrmState}).
+
+\subsubsection{New Path: \pkg{command\_mode\_decider} / \pkg{command\_mode\_switcher}}
+A newer, superseding architecture unifies operation-mode and MRM handling.
+\code{CommandModeDeciderBase} consumes \code{CommandModeAvailability}/\code{CommandModeStatus}
+directly and calls a pluggable \code{DeciderPlugin::decide()} each tick, publishing a
+\code{CommandModeRequest} to \pkg{command\_mode\_switcher}, which activates the matching
+pluginlib-loaded \code{CommandPlugin}. This is the architecture the proposed framework targets,
+since it is where active development is happening and where the \code{pull\_over} extension point
+already has priority wiring (below).
+
+\subsubsection{Key Finding: \code{pull\_over} Is a Reserved, Unimplemented Slot}
+This is the single most consequential finding of the architecture study, and it reframes the whole
+project: \textbf{there is no working pull-over MRM behavior anywhere in this Autoware checkout},
+in either architecture --
+
+\begin{itemize}[leftmargin=1.4em]
+  \item In the legacy path, \pkg{mrm\_handler} already has complete state-machine wiring for
+  \code{pull\_over} (the \code{use\_pull\_over} parameter, the
+  \code{/system/mrm/pull\_over\_manager/status,operate} topics/service, and dedicated transitions
+  in \code{updateMrmState()}/\code{operateMrm()}) -- but \textbf{no \code{pull\_over\_manager}
+  package exists in the source tree at all.} The service client would simply time out if
+  \code{use\_pull\_over} were ever set \code{true} (it defaults \code{false}).
+  \item In the new path, \code{PullOverSwitcher} (\pkg{autoware\_command\_mode\_switcher\_plugins})
+  is registered in \code{plugins.xml}, assigned mode ID \textbf{2003}
+  (\pkg{autoware\_command\_mode\_types/modes.hpp}), and the default decider plugin
+  (\code{command\_mode\_decider.cpp}) already gives it the \emph{top} MRM fallback priority --
+  ahead of \code{comfortable\_stop} and \code{emergency\_stop} -- \textbf{but
+  \code{PullOverSwitcher::initialize()} is a literally empty function body.} It satisfies the
+  plugin interface and does nothing else: no publishers, no subscribers, no logic.
+\end{itemize}
+
+In other words, this project is not being asked to override or fight existing pull-over behavior;
+it is being asked to \emph{fill an intentionally reserved, currently-empty extension point} that
+Autoware's own architects have already prioritized above comfortable-stop and emergency-stop in the
+fallback chain. That materially changes the risk profile of this work: there is no legacy behavior
+to regress, and the priority the maintainers assigned to \code{pull\_over} independently corroborates
+the human-factors finding in \cite{vu2023mrm} that a shoulder pull-over is the preferred MRM
+outcome when available.
+
+\subsubsection{Arbitration Details Relevant to Integration}
+\code{CommandPlugin::source()} returns one of \code{sources::\{stop,main,local,remote,
+emergency\_stop\}}. \code{comfortable\_stop}, \code{stop}, \code{autonomous}, and, critically,
+\code{pull\_over} all share \code{sources::main} -- meaning they all act \emph{through the normal
+planning$\to$control$\to$\pkg{vehicle\_cmd\_gate} pipeline}, differentiated only by what they feed
+into it (a velocity limit, in \code{comfortable\_stop}'s case). Only \code{emergency\_stop} has its
+own dedicated source, because its legacy operator bypasses planning entirely and writes
+\code{Control} commands directly. \textbf{This is an architectural constraint on the proposed
+design}: because \code{pull\_over} is already assigned \code{sources::main}, an implementation must
+act by modifying the normal planning pipeline's inputs (route/goal, velocity limits) -- not by
+emitting raw control commands the way emergency-stop does. This is precisely what
+\S\ref{sec:framework} proposes.
+
+The priority order itself (\code{pull\_over > comfortable\_stop > emergency\_stop} when more than
+one is available) is presently \textbf{hardcoded} in
+\code{CommandModeDecider::decide()}, with an explicit \code{TODO} comment in that function noting
+it should eventually follow the AD API fail-safe state-transition specification rather than a fixed
+order. This is flagged explicitly in \S\ref{sec:critique} and \S\ref{sec:phase2} as the exact seam
+where a future risk/uncertainty-aware arbitration decision (``is a pull-over actually safer than an
+in-lane stop \emph{right now}, given current traffic?'') must eventually be inserted.
+
+No MRM-specific code path was found in \pkg{behavior\_path\_planner} or \pkg{planning\_validator} --
+both \code{comfortable\_stop} implementations act purely by tightening the normal planning
+pipeline's velocity limit (\code{VelocityLimit} messages), with the rest of the stack (behavior
+planning, obstacle avoidance, validation) continuing to run unmodified underneath. This confirms the
+intended integration pattern for \code{pull\_over} is likewise to \emph{reuse}, not bypass, the
+normal behavior-planning and control stack.
+
+\subsection{Control and Trajectory-Validation Contract}
+\label{sec:control}
+
+Any trajectory this project generates must be consumable by the existing, unmodified control stack.
+
+\subsubsection{Trajectory Message Contract}
+\pkg{autoware\_trajectory\_follower\_node} consumes
+\code{autoware\_planning\_msgs::msg::Trajectory} (a \code{TrajectoryPoint[]}, each carrying
+\code{pose} (position \emph{and orientation} -- heading must be encoded, not inferred),
+\code{longitudinal\_velocity\_mps}, \code{lateral\_velocity\_mps}, \code{acceleration\_mps2},
+\code{heading\_rate\_rps}, and front/rear wheel angle), synchronized each control cycle with
+odometry, a steering report, acceleration, and operation-mode state -- all five must arrive or the
+cycle is skipped.
+
+\subsubsection{MPC Lateral Controller}
+Default vehicle model is the kinematic bicycle model with first-order steering delay (3-state:
+lateral error, heading error, steer). The QP cost combines a tracking-error weight matrix $Q$
+(lateral error, heading error, plus terminal weights) with a control-effort weight matrix $R$
+(steering input, lateral jerk, steer rate), with a separate low-curvature weight set that switches
+in below a configured curvature threshold. Default gains are tuned for highway-speed
+(\textless40\,km/h) operation on a specific reference vehicle and are \textbf{explicitly expected to
+need re-tuning} for a slow, high-curvature parking-style entry maneuver -- the curvature-indexed
+weight-set switch in particular is not designed for a regime where curvature is high
+\emph{everywhere} along the path, which the proposed framework addresses via a dedicated low-speed
+parameter profile (\S\ref{sec:controllercompat}).
+
+\subsubsection{PID Longitudinal Controller}
+A four-state FSM (\code{DRIVE}$\to$\code{STOPPING}$\to$\code{STOPPED}, plus \code{EMERGENCY}).
+Critically, \textbf{the controller does not smooth the reference velocity profile itself} -- its
+own documentation states the trajectory must already carry a smoothed, monotonically-decelerating
+velocity/acceleration profile down to zero at the stop pose. An \code{EMERGENCY} transition is
+triggered by a stop-point overshoot beyond 1.5\,m, which is a hard constraint the trajectory
+generator must respect by construction (\S\ref{sec:math_frenet}).
+
+\subsubsection{Planning Validator}
+\pkg{planning\_validator} is the last gate before control, and \textbf{any trajectory this project
+emits must pass through it unmodified in its role, i.e.\ its numeric thresholds are binding
+design constraints, not suggestions}: bounds on curvature, relative angle, lateral acceleration
+($\leq 9.8\,\mathrm{m/s^2}$), lateral jerk ($\leq 7.0\,\mathrm{m/s^3}$), longitudinal acceleration
+($\leq 9.8\,\mathrm{m/s^2}$), steering angle/rate, deviation from ego, and -- importantly for a
+re-planned pull-over path that must update frame to frame -- a \emph{consecutive-trajectory shift}
+limit (lateral 0.5\,m, forward 1.0\,m, backward 0.1\,m at the nearest point) that a jittery replanned
+path could easily violate if not explicitly smoothed between updates. On failure, the validator does
+\emph{not} itself raise an MRM; it either passes the trajectory through unchanged, substitutes the
+last valid trajectory, or replays the last valid trajectory with an overlaid soft-stop deceleration
+-- so a design that reliably fails validation degrades to a stop, not a silent hazard, which is a
+useful passive safety property to inherit for free.
+
+\subsubsection{Lane-Crossing Collision Checking Is Already Available}
+Two \pkg{planning\_validator} plugins are directly relevant to a lane-changing pull-over.
+\pkg{rear\_collision\_checker} is explicitly built for right/left-turn and lane-merge scenarios,
+combining a blind-spot time-to-collision sub-check and an adjacent-lane RSS-metric sub-check against
+tracked objects -- this is essentially the exact collision-safety net a multi-lane shoulder
+pull-over needs, and it requires \emph{no new code}, only for the maneuver to actually cross lanes
+through the normal planning pipeline where this checker already runs.
+\pkg{intersection\_collision\_checker} is turn-lanelet-specific and likely does not engage for a
+generic shoulder entry unless that lanelet happens to be turn-tagged.
+
+\section{Workspace Architecture Decision}
+\label{sec:workspace}
+
+\textbf{Decision: this work is placed in a new, dedicated overlay workspace,
+\code{\textasciitilde/shoulder\_pullover\_ws}, separate from \pkg{shoulder\_detection\_ws}.}
+
+\subsection{Rationale}
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{Dependency-weight asymmetry.} \pkg{shoulder\_detection\_ws}'s two packages depend
+  only on core ROS~2, PCL, OpenCV, and tf2 -- confirmed by direct inspection of their
+  \code{package.xml} files; neither links against any Autoware planning/control package. A pull-over
+  MRM module, by contrast, must build against
+  \pkg{autoware\_behavior\_path\_planner\_common}, \pkg{autoware\_command\_mode\_switcher} (+
+  \pkg{\_types}), \pkg{autoware\_route\_handler}, \pkg{path\_safety\_checker}, and
+  \pkg{autoware\_planning\_msgs} -- a substantial slice of the Autoware Universe dependency graph.
+  Folding that into the perception workspace would force every future \pkg{shoulder\_detection\_ws}
+  rebuild to carry that weight and make its build brittle to Autoware core version bumps, for no
+  benefit to the perception code.
+  \item \textbf{Blast-radius and churn isolation.} \pkg{shoulder\_detection\_ws} is currently a
+  stable, signed-off deliverable (``we are okay with this version for now''). The centerline node's
+  own history (\S in \pkg{shoulder\_centerline\_node} project memory) shows this class of work churns
+  heavily -- multiple full reverts during iteration. A new planning/control-adjacent module,
+  touching safety-relevant interfaces, should be free to iterate and even break without any risk of
+  destabilizing the already-accepted perception deliverable's build or git history.
+  \item \textbf{Only a topic/service coupling is actually needed.} The new module's only runtime
+  dependency on \pkg{shoulder\_detection\_ws} is the \code{shoulder\_centerline\_path} topic (and,
+  for triggering, a call to \pkg{mission\_planner}'s routing service) -- both pure ROS~2 interfaces
+  that cross workspace boundaries for free. There is no shared build artifact or header that would
+  require co-location.
+  \item \textbf{Matches both Autoware's own convention and the user's existing operational
+  pattern.} Autoware itself separates perception, planning, control, and system concerns into
+  distinct top-level trees that interoperate purely over topics/services. The user's own launch
+  invocation already layers three overlays (\code{/opt/ros/humble} $\to$
+  \code{\textasciitilde/autoware/install} $\to$ \code{\textasciitilde/shoulder\_detection\_ws/install}); a fourth overlay,
+  \code{\textasciitilde/shoulder\_pullover\_ws/install}, slots into that same, already-familiar
+  sourcing chain with no change in operational habit.
+\end{enumerate}
+
+\subsection{Non-Goals}
+This decision does not propose forking, vendoring, or patching any file inside
+\code{\textasciitilde/autoware}. Every extension point identified in \S\ref{sec:autoware} is reachable
+from new, out-of-tree sibling packages (new pluginlib classes, new \code{plugins.xml} entries, new
+parameter files referenced from launch), consistent with how \pkg{goal\_planner} itself is wired in.
+
+\section{Proposed Framework Architecture}
+\label{sec:framework}
+
+\subsection{Package Layout}
+Two new ROS~2 packages, both under \code{\textasciitilde/shoulder\_pullover\_ws/src/}:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \pkg{autoware\_shoulder\_pullover\_module} -- a \pkg{behavior\_path\_planner} scene-module
+  plugin (\S\ref{sec:goalplanner}'s pattern), responsible for: scoring candidate points along the
+  live \code{shoulder\_centerline\_path} (\S\ref{sec:math_goal}), issuing the routing request that
+  triggers the maneuver, and generating the final shoulder-entry path segment. It deliberately reuses
+  \pkg{goal\_planner}'s \code{SHIFT}/\code{ARC} pull-over-planner primitives and
+  \pkg{path\_safety\_checker} rather than reimplementing them.
+  \item \pkg{autoware\_shoulder\_pullover\_switcher} -- fills the empty
+  \code{PullOverSwitcher::initialize()} body (\S\ref{sec:mrm}) with the minimal logic needed to (a)
+  observe MRM-trigger state, (b) hand off to \pkg{autoware\_shoulder\_pullover\_module} by driving a
+  routing request, and (c) report \code{MrmState} transitions
+  (\code{Operating}$\to$\code{Succeeded}/\code{Failed}) back through the existing
+  \code{command\_mode\_decider}/\code{switcher} channel, mirroring exactly how
+  \code{ComfortableStopSwitcher} already does this for its behavior. Whether to author a genuinely
+  new class here or directly complete \code{PullOverSwitcher} in place is left as an open
+  implementation-time decision; both are architecturally equivalent since the mode ID (2003) and
+  priority are already reserved.
+\end{itemize}
+
+\subsection{End-to-End Data Flow}
+\begin{enumerate}[leftmargin=1.8em]
+  \item \pkg{shoulder\_centerline} (existing, \pkg{shoulder\_detection\_ws}) continuously publishes
+  \code{\textasciitilde/shoulder\_centerline\_path} (ego-relative) and
+  \code{\textasciitilde/shoulder\_centerline\_path\_map} (map-frame, accumulating).
+  \item \pkg{autoware\_shoulder\_pullover\_module} continuously (not only during an MRM) maintains a
+  scored list of \emph{candidate safe shoulder goals} along the map-frame centerline
+  (\S\ref{sec:math_goal}) -- precomputing this before it is needed keeps the MRM activation path
+  itself latency-critical-free.
+  \item On MRM trigger, \pkg{autoware\_shoulder\_pullover\_switcher}'s \code{initialize()}-installed
+  logic is invoked by \code{command\_mode\_decider} (already top MRM priority, \S\ref{sec:mrm}); it
+  selects the current best-scored candidate and calls
+  \pkg{autoware\_mission\_planner\_universe}'s \code{SetRoutePoints} service with that pose and
+  \code{allow\_goal\_modification=true}.
+  \item \code{route\_handler} updates; the existing \pkg{lane\_change} module(s) activate as needed
+  (one activation per lane crossed, sequenced by the existing slot/RTC mechanism -- no new
+  coordination logic is written, \S\ref{sec:goalplanner}) to bring the vehicle into the lane
+  adjacent to the shoulder.
+  \item \pkg{autoware\_shoulder\_pullover\_module}'s own \code{isExecutionRequested()} goes true
+  once the goal is reachable from the (now shoulder-adjacent) current lane, exactly mirroring
+  \pkg{goal\_planner}'s own activation condition; it generates the final entry segment using the
+  reused \code{SHIFT}/\code{ARC} planner primitives, constrained per \S\ref{sec:math_frenet}.
+  \item The resulting \code{PathWithLaneId} flows through the \emph{unmodified} downstream stack:
+  \pkg{behavior\_velocity\_planner} $\to$ obstacle-avoidance/path-optimizer $\to$
+  \pkg{planning\_validator} (\S\ref{sec:control}, all thresholds respected by construction) $\to$
+  \pkg{trajectory\_follower\_node} (MPC + PID, switched to a low-speed parameter profile,
+  \S\ref{sec:controllercompat}) $\to$ vehicle.
+\end{enumerate}
+
+\subsection{Reuse Ledger}
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Reused as-is} & \textbf{New}\\
+\midrule
+\pkg{path\_safety\_checker} (RSS + predicted-polygon) & Shoulder-centerline goal scoring \\
+\pkg{lane\_change} module + slot scheduler & \pkg{PullOverSwitcher} MRM-trigger logic \\
+\code{goal\_planner}'s \code{SHIFT}/\code{ARC} path primitives & Low-speed MPC/PID param profile \\
+\pkg{rear\_collision\_checker} (adjacent-lane RSS/TTC) & Frenet constraint set from \S\ref{sec:math_frenet} \\
+\pkg{mission\_planner}'s \code{SetRoutePoints} routing API & \\
+\pkg{planning\_validator} (all checks, unmodified) & \\
+\bottomrule
+\end{tabular}
+\caption{What the framework reuses wholesale from Autoware core versus what is genuinely new.}
+\end{table}
+
+\section{Mathematical Formulation and Methodology}
+\label{sec:math}
+
+The formulation below is deliberately \emph{classical} (deterministic point estimates, hard
+constraints) per the stated scope, but every term is annotated where it is designed to become a
+distribution or a reachable-set bound in Phase~2 (\S\ref{sec:phase2}).
+
+\subsection{Safe Shoulder-Goal Scoring}
+\label{sec:math_goal}
+Let $\mathcal{W} = \{w_1, \ldots, w_N\}$ be the map-frame waypoints of
+\code{shoulder\_centerline\_path\_map} at query time, each carrying position, heading, signed
+curvature $\kappa(w_i)$, and (from the underlying \code{world\_bins\_} accumulation) the number of
+supporting samples $n(w_i)$ as a maturity proxy. Define a candidate score
+
+\begin{equation}
+\label{eq:goalscore}
+S(w_i) = \alpha_1\, R(w_i) \;+\; \alpha_2\, M(w_i) \;+\; \alpha_3\, C(w_i) \;-\; \alpha_4\, D(w_i)
+\;-\; \alpha_5\, \Kappa(w_i)
+\end{equation}
+
+with all terms normalized to $[0,1]$ and $\sum \alpha_j = 1$:
+\begin{itemize}[leftmargin=1.6em]
+  \item $R(w_i)$ -- \emph{continuous safe run length} ahead of $w_i$: the arclength over which
+  consecutive waypoints remain classified/confirmed (bounded by $n(w_j) \geq
+  n_{\min}$ for a forward window), rewarding a goal with enough confirmed shoulder \emph{after} it
+  to actually stop, not just at it. \emph{(Phase 2: replace the hard $n_{\min}$ gate with the
+  probability the run remains valid under detector uncertainty.)}
+  \item $M(w_i) = n(w_i) / n_{\text{ref}}$ -- maturity: how many independent LiDAR/mask-IPM samples
+  back this bin, capped at a reference count; directly reuses the existing
+  \code{min\_world\_bin\_samples} confirmation mechanism (currently 44, see project memory) as a
+  ready-made quality signal.
+  \item $C(w_i)$ -- lateral clearance margin, from the extent-midpoint estimator's own trimmed
+  min/max edge distances, rewarding goals nearer the center of a \emph{wide} confirmed shoulder
+  segment over a narrow one.
+  \item $D(w_i)$ -- normalized ETA/distance from current ego pose along the route, penalizing
+  candidates that would require an infeasibly abrupt maneuver.
+  \item $\Kappa(w_i) = |\kappa(w_i)| / \kappa_{\max}$ -- normalized centerline curvature, penalizing
+  goals on a sharply curved stretch of shoulder (harder to enter cleanly at low speed).
+\end{itemize}
+The selected goal is $w^\star = \arg\max_i S(w_i)$ subject to $D(w_i) \geq D_{\min}$ (a hard
+minimum-stopping-distance floor derived from the current speed and the comfortable/emergency
+deceleration limits already configured for \code{comfortable\_stop}, so the maneuver is never
+requested somewhere the vehicle physically cannot decelerate to before reaching).
+
+\subsection{Constrained Frenet-Frame Trajectory Generation}
+\label{sec:math_frenet}
+Following \cite{werling2010frenet,werling2011manifolds}, the entry maneuver from the
+shoulder-adjacent lane's centerline to $w^\star$ is planned in that lane's Frenet frame
+$(s, d)$, decoupled into independent lateral and longitudinal problems.
+
+\textbf{Lateral (quintic) problem.} Given boundary conditions
+$(d_0, \dot d_0, \ddot d_0)$ at $t=0$ and $(d_f, 0, 0)$ at $t=T$ (a clean stop laterally centered on
+the shoulder), the unique minimum-jerk polynomial is
+
+\begin{equation}
+d(t) = a_0 + a_1 t + a_2 t^2 + a_3 t^3 + a_4 t^4 + a_5 t^5,
+\end{equation}
+
+with coefficients solved in closed form from the six boundary conditions (standard quintic Hermite
+solve, as in \cite{werling2010frenet}). A family of candidates is generated by sampling
+$(d_f, T)$ over a bounded grid, and each is scored by
+
+\begin{equation}
+\label{eq:latcost}
+J_{d} = k_j \!\int_0^T \! \dddot d(t)^2\, dt \;+\; k_T\, T \;+\; k_d\, (d_f - d^\star)^2,
+\end{equation}
+
+the classic jerk/time/terminal-offset trade-off, where $d^\star$ is the lateral offset to
+$w^\star$'s position in this frame.
+
+\textbf{Longitudinal problem.} Two regimes are used depending on maneuver phase: a
+velocity-keeping quartic while still in the travel lane, and a stop-to-position quintic for the
+final approach into the shoulder (boundary condition $\dot s(T) = 0$, satisfying, by construction,
+the PID longitudinal controller's requirement in \S\ref{sec:control} that the reference trajectory
+itself carry a smoothed, monotonic deceleration to zero -- the controller is never asked to invent
+that shape).
+
+\textbf{Hard constraints.} Every sampled candidate is rejected unless it satisfies, for all
+$t \in [0,T]$:
+
+\begin{align}
+|\kappa(t)| &\leq \kappa_{\max} && \text{(from \pkg{planning\_validator}'s curvature bound, \S\ref{sec:control})}\\
+|a_{\text{lat}}(t)| &\leq 9.8\ \mathrm{m/s^2} && \text{(validator lateral-accel bound)}\\
+|j_{\text{lat}}(t)| &\leq 7.0\ \mathrm{m/s^3} && \text{(validator lateral-jerk bound)}\\
+|a_{\text{lon}}(t)| &\leq 9.8\ \mathrm{m/s^2} && \text{(validator longitudinal-accel bound)}\\
+|\delta(t)| &\leq \delta_{\max},\ |\dot\delta(t)| \leq \dot\delta_{\max} && \text{(steering angle/rate bound)}
+\end{align}
+
+with curvature related to the Frenet derivatives by the standard planar formula
+$\kappa(t) = \dfrac{\dot x(t)\ddot y(t) - \dot y(t)\ddot x(t)}{\big(\dot x(t)^2+\dot y(t)^2\big)^{3/2}}$
+after re-projection to Cartesian coordinates. \textbf{These are not arbitrary safety margins chosen
+by this project; they are read directly from \pkg{planning\_validator}'s own configured thresholds}
+(\S\ref{sec:control}), so a generated trajectory is validator-compliant \emph{by construction}
+rather than by hope, and the frame-to-frame \emph{trajectory-shift} limit the validator also enforces
+(0.5\,m lateral / 1.0\,m forward / 0.1\,m backward) is additionally imposed as a rate limit on how
+much $w^\star$ itself is permitted to change between consecutive re-plans (a low-pass filter on the
+$\arg\max$ selection in Eq.~\ref{eq:goalscore}, not just on the resulting path).
+
+Among all constraint-satisfying candidates, the one minimizing the combined cost
+$J = J_d + J_s$ (lateral plus the analogous longitudinal cost) is selected -- a sampling-based
+constrained optimum, not a full nonlinear program, which is what keeps this tractable in real time
+(\S\ref{sec:complexity}).
+
+\subsection{Multi-Lane-Change Sequencing}
+The lanelet2 routing graph already maintained by \code{route\_handler} is treated as a directed
+graph $G=(V,E)$ over lanelets, and the lane sequence from ego's current lane $\ell_0$ to the
+shoulder-adjacent lane $\ell_k$ is the shortest path (by lane-change count, or by a cost weighting
+lane-change difficulty) in $G$. Each edge on that path corresponds to exactly one activation of the
+existing \pkg{lane\_change} module, itself Frenet-planned by Autoware core; the final edge into the
+shoulder lane is the module described in \S\ref{sec:math_frenet}. No new graph-search code is
+strictly required -- \code{route\_handler}'s existing route-generation already performs this search
+when \code{SetRoutePoints} is called with the shoulder goal; this subsection documents the
+underlying mechanism rather than proposing a new algorithm to write.
+
+\subsection{Controller Compatibility}
+\label{sec:controllercompat}
+Because default MPC/PID gains are tuned for highway-speed operation
+(\S\ref{sec:control}), the framework proposes a discrete \emph{parameter profile switch} -- not a
+new controller -- activated for the duration the maneuver's \code{MrmState.behavior == PULL\_OVER}:
+tightened $Q$/relaxed $R$ weighting for tracking accuracy over control smoothness (justified since
+speed, and therefore disturbance energy, is low), a shortened MPC prediction horizon matched to the
+maneuver's own short length, relaxed curvature-indexed steer-rate tables (since curvature is
+deliberately high throughout a shoulder entry, not just in corners), and confirmation that
+\code{mpc\_min\_prediction\_length} (5.0\,m default) does not exceed the generated segment's own
+length. This mirrors the precedent \code{comfortable\_stop} already sets of modifying planning/
+control \emph{parameters} rather than substituting a new controller implementation.
+
+\subsection{Computational Complexity}
+\label{sec:complexity}
+Goal scoring (Eq.~\ref{eq:goalscore}) is $O(N)$ in the number of live centerline waypoints
+(typically $\leq$ a few hundred). Trajectory generation is the standard Werling-style sampling
+scheme: closed-form quintic/quartic coefficients per candidate ($O(1)$ each, no iterative solve),
+over a bounded $(d_f, T)$ grid, giving overall $O(|grid|)$ per re-plan cycle -- the same complexity
+class Werling et al.\ report as real-time-capable on 2010-era hardware \cite{werling2010frenet},
+and substantially cheaper than the \code{FREESPACE} (hybrid-A*-class) option \pkg{goal\_planner}
+already carries for the rare obstructed case, which remains available as a fallback planner type
+without any new complexity budget being introduced.
+
+\section{Anticipated Critiques and Mitigations}
+\label{sec:critique}
+
+This section is a deliberate self-adversarial pass, anticipating the objections a rigorous
+reviewer at a top venue (IEEE T-ITS, T-IV, ICRA/IROS) would raise against this framework as
+described so far.
+
+\begin{enumerate}[leftmargin=1.8em]
+  \item \textbf{``A fixed-priority MRM arbitration (pull\_over $>$ comfortable\_stop $>$
+  emergency\_stop) is not obviously correct.''} A shoulder pull-over that takes several seconds and
+  crosses lanes can, in sufficiently dense or erratic traffic, be riskier than an immediate in-lane
+  stop -- yet Autoware's own \code{command\_mode\_decider} currently selects by a hardcoded,
+  context-blind order (and, per \S\ref{sec:mrm}, its own source code carries a TODO acknowledging
+  this). \emph{Mitigation}: this is explicitly not solved in this phase; it is named as the primary
+  target of the Phase~2 risk layer (\S\ref{sec:phase2}), which will condition the arbitration
+  decision on live traffic/uncertainty rather than a fixed lexicographic order.
+  \item \textbf{``No formal safety guarantee is offered.''} The framework provides constraint
+  satisfaction against Autoware's configured operating limits and reuses RSS-style pairwise safety
+  checks, but offers no system-level guarantee against, e.g., a simultaneous multi-agent
+  worst-case scenario, unlike a full reachable-set or RSS-composed proof.
+  \emph{Mitigation}: explicitly scoped out as future work (\cite{shalevshwartz2017rss},
+  \cite{yang2025reachable}); this document does not claim formal safety, only constraint
+  compliance with the existing, already-deployed safety layer.
+  \item \textbf{``The evaluation protocol is unspecified.''} No experiment design has yet been run;
+  a single CARLA route on GPU-contended hardware (as used for the perception work) is not
+  statistically meaningful. \emph{Mitigation}: the natural next step is a defined protocol --
+  multiple routes/seeds, a baseline comparison against stock \code{comfortable\_stop} (in-lane
+  stop) and a synthetic ``no MRM'' control, and quantitative metrics (success rate, lateral
+  deviation from shoulder center at rest, peak/RMS lateral jerk, time-to-stable-stop, and any
+  validator soft-stop/rejection events) -- flagged here as required before any performance claim is
+  made, not yet executed.
+  \item \textbf{``The shoulder representation is a simplified spline, not obstacle-instance
+  aware.''} The centerline is a smoothed geometric estimate; it does not itself detect
+  discontinuities such as driveways, mailboxes, or a parked vehicle already occupying the target
+  spot. \emph{Mitigation}: partially covered for free, since the final path still passes through
+  \pkg{behavior\_velocity\_planner}/\pkg{path\_safety\_checker}'s object-aware collision checks
+  before reaching control (\S\ref{sec:control}) -- but the \emph{goal-selection} stage itself
+  (Eq.~\ref{eq:goalscore}) does not yet reason about occupancy at the candidate pose; adding an
+  occupancy/object check at candidate-scoring time (not just at final-path-safety time) is named as
+  an immediate hardening item even within the classical phase, ahead of full Phase~2 work.
+  \item \textbf{``Single monocular camera + LiDAR fusion has known range-dependent geometric
+  bias.''} Already diagnosed and partially mitigated in the perception layer itself (the
+  \code{world\_min\_capture\_x} absolute-distance gate, project memory), reflecting a documented
+  monocular-IPM limitation, not a new concern for this document -- but it means goal candidates
+  necessarily inherit whatever residual bias remains in the centerline at the time of query; the
+  maturity term $M(w_i)$ in Eq.~\ref{eq:goalscore} is the direct mitigation, preferring
+  well-confirmed bins over freshly observed ones.
+  \item \textbf{``Domain gap: a DINOv2 model trained on CVAT annotations of CARLA imagery may not
+  transfer to real sensors.''} True and unaddressed by this document, which is explicitly scoped
+  to the CARLA-simulated project this codebase currently targets; any claim of real-world
+  applicability would require re-validation with real-world training data and sensor noise
+  characteristics, named here as an explicit limitation (\S\ref{sec:limitations}), not something
+  this framework solves.
+  \item \textbf{``Retuned low-speed MPC/PID gains are asserted, not derived or validated.''}
+  \S\ref{sec:controllercompat} states the \emph{direction} of retuning (tighter tracking weight,
+  shorter horizon, relaxed steer-rate tables) from first principles about the operating regime, but
+  offers no tuned numeric values nor closed-loop stability analysis. \emph{Mitigation}: flagged as
+  implementation-phase work requiring either manual tuning against the validator's own numeric
+  limits or a data-driven gain-scheduling approach, not resolved here.
+  \item \textbf{``Reuse estimates (60--70\% of goal\_planner's scaffolding) are an informed
+  guess, not a measured figure.''} Stated honestly as an estimate derived from structural
+  similarity assessed during the architecture study (\S\ref{sec:goalplanner}), not from having
+  written the new module yet; the real figure will only be known after implementation.
+\end{enumerate}
+
+\section{Phase 2 Preview: Risk and Uncertainty Integration}
+\label{sec:phase2}
+
+Although out of scope for this document, the framework above was deliberately shaped to make the
+following extensions additive rather than architecturally disruptive:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Goal scoring} (Eq.~\ref{eq:goalscore}): each term $R, M, C, D, \Kappa$ becomes the
+  mean of a distribution (e.g.\ a Beta distribution over detector confidence for $M$, a Gaussian
+  over centerline lateral position for $C$), and $\arg\max$ selection becomes an expected-utility or
+  chance-constrained selection, in the style of \cite{lin2025contingency}.
+  \item \textbf{Trajectory constraints} (\S\ref{sec:math_frenet}): the deterministic bounds become
+  either chance constraints (probability of violation $\leq \epsilon$) or reachable-set barrier
+  constraints following \cite{yang2025reachable}, particularly around occluded regions the
+  perception system cannot currently see past.
+  \item \textbf{MRM arbitration}: the hardcoded \code{pull\_over > comfortable\_stop >
+  emergency\_stop} order in \code{command\_mode\_decider} (\S\ref{sec:mrm}) is the concrete,
+  identified seam where a risk-conditioned decision -- e.g., an RSS-style
+  \cite{shalevshwartz2017rss} or contingency-trajectory-based comparison of the two strategies'
+  realized risk under current traffic -- replaces the fixed lexicographic order, directly answering
+  the critique in \S\ref{sec:critique}, item 1.
+\end{itemize}
+
+\section{Limitations of This Document}
+\label{sec:limitations}
+
+This is an architecture and framework document, not an implementation report: no new code has been
+written or tested against the running stack; all Autoware-side findings are current as of the
+project's pinned checkout and may drift as upstream Autoware evolves (notably, the legacy
+\pkg{mrm\_handler} path appears to be mid-deprecation in favor of \pkg{command\_mode\_decider}, per
+the coexistence of both architectures observed in \S\ref{sec:mrm}); and no simulation results are
+yet available to substantiate any of the quantitative claims implied by \S\ref{sec:math} (e.g.\
+real-time feasibility is argued by complexity class and precedent, not measured on this project's
+own hardware).
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+The architecture study found that Autoware Universe already reserves, but does not implement, a
+top-priority \code{pull\_over} MRM behavior in its current command-mode arbitration system --
+independently corroborating human-factors evidence \cite{vu2023mrm} that a shoulder pull-over is
+the preferred MRM outcome when geometrically available. This project's existing shoulder-detection
+and centerline-waypoint perception stack is directly usable to fill that slot. The proposed
+framework fills it via two new, plugin-only packages in a dedicated overlay workspace, reusing
+Autoware's own \pkg{goal\_planner}, \pkg{lane\_change}, \pkg{path\_safety\_checker}, and
+\pkg{planning\_validator} machinery wherever possible, and introduces a classical, Werling-style
+constrained Frenet-frame trajectory layer whose constraint bounds are drawn directly from the
+existing control/validation stack's own configured limits, so generated maneuvers are compatible by
+construction rather than by later tuning. Every scoring and constraint term is explicitly structured
+for a Phase~2 risk/uncertainty extension, with the highest-value single target for that phase --
+the currently-hardcoded MRM strategy arbitration order -- identified concretely in
+\S\ref{sec:mrm} and \S\ref{sec:critique}.
+
+\begin{thebibliography}{9}
+
+\bibitem{iso23793}
+ISO 23793-1:2020,
+\emph{Intelligent transport systems --- Minimal risk manoeuvre (MRM) for automated driving --- Part 1: Framework, terms and definitions},
+International Organization for Standardization, 2020.
+
+\bibitem{vu2023mrm}
+V. Vu, F. Warg, A. Thors\'en, S. Ursing, F. Sunnerstam, J. Holler, C. Bergenhem, and I. Cosmin,
+``Minimal Risk Manoeuvre Strategies for Cooperative and Collaborative Automated Vehicles,''
+in \emph{2023 53rd Annual IEEE/IFIP International Conference on Dependable Systems and Networks Workshops (DSN-W)}, 2023.
+doi: 10.1109/DSN-W58399.2023.00039.
+
+\bibitem{lee2022pullover}
+J. Lee, K. Oh, S. Oh, Y. Yoon, S. Kim, T. Song, and K. Yi,
+``Emergency Pull-Over Algorithm for Level 4 Autonomous Vehicles Based on Model-Free Adaptive Feedback Control With Sensitivity and Learning Approaches,''
+\emph{IEEE Access}, vol. 10, 2022.
+doi: 10.1109/ACCESS.2022.3156275.
+
+\bibitem{werling2010frenet}
+M. Werling, J. Ziegler, S. Kammel, and S. Thrun,
+``Optimal Trajectory Generation for Dynamic Street Scenarios in a Fren\'et Frame,''
+in \emph{2010 IEEE International Conference on Robotics and Automation (ICRA)}, 2010, pp. 987--993.
+doi: 10.1109/ROBOT.2010.5509799.
+
+\bibitem{werling2011manifolds}
+M. Werling, S. Kammel, J. Ziegler, and L. Gr\"oll,
+``Optimal Trajectories for Time-Critical Street Scenarios Using Discretized Terminal Manifolds,''
+\emph{The International Journal of Robotics Research}, vol. 31, no. 3, 2011.
+doi: 10.1177/0278364911423042.
+
+\bibitem{lin2025contingency}
+Z. Lin, J. Lan, A.-T. Nguyen, and D. Flynn,
+``Contingency-Aware Spatiotemporal Optimization for Safe Autonomous Vehicle Trajectory Planning,''
+\emph{IEEE Transactions on Intelligent Transportation Systems}, 2025.
+doi: 10.1109/TITS.2025.3597234.
+
+\bibitem{yang2025reachable}
+R. Yang, L. Zheng, S. Ge, and J. Ma,
+``Safe and Nonconservative Contingency Planning for Autonomous Vehicles via Online Learning-Based Reachable Set Barriers,''
+\emph{IEEE Transactions on Control Systems Technology}, 2025/2026.
+doi: 10.1109/TCST.2026.3675339.
+
+\bibitem{shalevshwartz2017rss}
+S. Shalev-Shwartz, S. Shammah, and A. Shashua,
+``On a Formal Model of Safe and Scalable Self-Driving Cars,''
+arXiv:1708.06374, 2017.
+
+\bibitem{poggenhans2018lanelet2}
+F. Poggenhans, J.-H. Pauls, J. Janosovits, S. Orf, M. Naumann, F. Kuhnt, and M. Mayr,
+``Lanelet2: A High-Definition Map Framework for the Future of Automated Driving,''
+in \emph{2018 21st International Conference on Intelligent Transportation Systems (ITSC)}, 2018.
+doi: 10.1109/ITSC.2018.8569929.
+
+\end{thebibliography}
+
+\end{document}
