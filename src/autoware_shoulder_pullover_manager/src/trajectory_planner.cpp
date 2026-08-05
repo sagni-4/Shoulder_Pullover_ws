@@ -134,99 +134,68 @@ PullOverTrajectoryPlanner::PullOverTrajectoryPlanner(const TrajectoryPlannerPara
 }
 
 std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
-  const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose, double duration,
-  const rclcpp::Time & stamp) const
+  const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose, double turn_radius,
+  double duration, const rclcpp::Time & stamp) const
 {
-  const double start_yaw = yawFromQuaternion(start.pose.orientation);
-  const double goal_yaw = yawFromQuaternion(goal_pose.orientation);
+  // The maneuver's *shape*: a constant-radius Dubins connector, curvature
+  // bounded by construction (see class docs for why this replaced two
+  // independent Cartesian quintics). Geometry only depends on start/goal
+  // pose and turn_radius, not on `duration` -- if it's infeasible here it's
+  // infeasible for every duration this candidate loop will try at this
+  // radius.
+  const DubinsPath path(start.pose, goal_pose, turn_radius);
+  if (!path.valid()) {
+    return std::nullopt;
+  }
 
-  const double vxs = start.speed * std::cos(start_yaw);
-  const double vys = start.speed * std::sin(start_yaw);
-  // Deliberately zero start acceleration: injecting a noisy live acceleration
-  // estimate as a hard boundary condition risks a poorly-conditioned fit
-  // more than it helps -- see class-level docs.
+  // Deliberately zero start/goal acceleration: injecting a noisy live
+  // acceleration estimate as a hard boundary condition risks a
+  // poorly-conditioned fit more than it helps -- see class-level docs.
   constexpr double kZeroAccel = 0.0;
 
-  // A small nonzero terminal speed, oriented along the goal's own heading,
-  // keeps yaw(t) well-defined as t -> T (atan2(0,0) is undefined); the
+  // *Speed* along that fixed shape: a scalar minimum-jerk quintic over arc
+  // length s, from the vehicle's current speed to a small nonzero terminal
+  // approach speed (keeps the profile well-defined right up to t=T; the
   // actual last sample below is still force-zeroed to satisfy the PID
-  // longitudinal controller's need for an explicit stop point (see the
+  // longitudinal controller's need for an explicit stop point -- see the
   // framework report's control/validation contract section).
-  const double vxe = params_.terminal_approach_speed * std::cos(goal_yaw);
-  const double vye = params_.terminal_approach_speed * std::sin(goal_yaw);
-
-  const Quintic qx = solveQuintic(
-    start.pose.position.x, vxs, kZeroAccel, goal_pose.position.x, vxe, kZeroAccel, duration);
-  const Quintic qy = solveQuintic(
-    start.pose.position.y, vys, kZeroAccel, goal_pose.position.y, vye, kZeroAccel, duration);
+  const Quintic qs = solveQuintic(
+    0.0, start.speed, kZeroAccel, path.length(), params_.terminal_approach_speed, kZeroAccel,
+    duration);
 
   Trajectory trajectory;
   trajectory.header.stamp = stamp;
   trajectory.header.frame_id = "map";
 
   const int num_samples = std::max(2, static_cast<int>(std::round(duration / params_.dt)) + 1);
+  trajectory.points.reserve(static_cast<std::size_t>(num_samples));
 
-  // First pass: raw kinematics only. Heading is deliberately NOT derived
-  // from the instantaneous velocity vector here -- atan2(vy, vx) is
-  // numerically unstable at low speed (small floating-point perturbations
-  // swing the angle wildly), and this planner's start boundary condition is
-  // v=0, a=0 (see above), so early samples of a maneuver starting from rest
-  // spend several cycles at near-zero speed. An earlier version thresholded
-  // on speed > 1e-3 m/s and fell back to a constant goal-heading below that
-  // -- which produced a *discontinuous* heading jump exactly at the
-  // threshold crossing, read as a spurious huge curvature spike by
-  // satisfiesKinematicConstraints, and caused every candidate starting near
-  // rest to be rejected. Fixed below by deriving heading from consecutive
-  // *sampled positions* instead (second pass) -- smooth by construction,
-  // no velocity-magnitude threshold involved at all.
-  struct RawSample
-  {
-    double x, y, z, vx, vy, ax, ay, t;
-  };
-  std::vector<RawSample> raw;
-  raw.reserve(static_cast<std::size_t>(num_samples));
   for (int i = 0; i < num_samples; ++i) {
+    const bool is_last = (i + 1 == num_samples);
     const double t = std::min(duration, i * params_.dt);
-    raw.push_back(
-      {qx.position(t), qy.position(t), goal_pose.position.z, qx.velocity(t), qy.velocity(t),
-       qx.acceleration(t), qy.acceleration(t), t});
-  }
-
-  trajectory.points.reserve(raw.size());
-  for (std::size_t i = 0; i < raw.size(); ++i) {
-    const bool is_last = (i + 1 == raw.size());
-    const RawSample & s = raw[i];
+    // Clamped defensively; solveQuintic's boundary conditions already put
+    // s(duration) == path.length() exactly, up to floating-point error.
+    const double s = std::clamp(qs.position(t), 0.0, path.length());
+    const DubinsPath::PathPoint path_point = path.pointAt(s);
 
     TrajectoryPoint point;
-    point.pose.position.x = s.x;
-    point.pose.position.y = s.y;
-    point.pose.position.z = s.z;  // Ground height interpolated at the goal.
+    point.pose.position.x = path_point.x;
+    point.pose.position.y = path_point.y;
+    point.pose.position.z = goal_pose.position.z;  // Ground height interpolated at the goal.
+    // Exact analytic heading from the Dubins geometry -- unlike the old
+    // per-axis fit, well-defined at any speed including v=0, no
+    // position-delta finite-differencing or near-zero-speed workaround
+    // needed here.
+    point.pose.orientation = quaternionFromYaw(path_point.yaw);
 
-    // Heading from the position delta to the next sample -- always
-    // well-defined, never degenerates near zero speed. The last sample has
-    // no "next" point to difference against, so it reuses the previous
-    // point's heading (the final segment's direction) instead.
-    double yaw;
-    if (!is_last) {
-      yaw = std::atan2(raw[i + 1].y - s.y, raw[i + 1].x - s.x);
-    } else {
-      yaw = trajectory.points.empty() ? goal_yaw
-                                       : yawFromQuaternion(trajectory.points.back().pose.orientation);
-    }
-    point.pose.orientation = quaternionFromYaw(yaw);
-
-    const double speed = std::hypot(s.vx, s.vy);
+    const double speed = std::max(0.0, qs.velocity(t));
     point.longitudinal_velocity_mps = static_cast<float>(is_last ? 0.0 : speed);
     point.lateral_velocity_mps = 0.0F;
-    // Signed tangential acceleration (component of (ax,ay) along velocity
-    // direction), matching TrajectoryPoint's "does not consider direction"
-    // convention. Falls back to 0 at near-zero speed, where "tangential"
-    // is undefined anyway and the true acceleration is dominated by jerk,
-    // not something this scalar field can represent regardless.
-    point.acceleration_mps2 = static_cast<float>(
-      is_last ? 0.0 : (speed > 1e-2 ? (s.vx * s.ax + s.vy * s.ay) / speed : 0.0));
+    // Tangential acceleration is exact and direct now that s(t) *is* the
+    // longitudinal coordinate -- no vx/vy projection needed.
+    point.acceleration_mps2 = static_cast<float>(is_last ? 0.0 : qs.acceleration(t));
 
-    const auto time_from_start = rclcpp::Duration::from_seconds(s.t);
+    const auto time_from_start = rclcpp::Duration::from_seconds(t);
     point.time_from_start.sec = static_cast<int32_t>(time_from_start.seconds());
     point.time_from_start.nanosec =
       static_cast<uint32_t>(time_from_start.nanoseconds() % 1000000000LL);
@@ -394,33 +363,54 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const double initial_guess =
     std::clamp(distance / average_speed_estimate, params_.min_duration, params_.max_duration);
 
-  // Try increasing durations starting from the distance-based estimate --
-  // a longer duration generally relaxes curvature/jerk/acceleration, so
-  // this search order finds the most prompt feasible maneuver first.
-  for (double duration = initial_guess; duration <= params_.max_duration;
-       duration += params_.duration_step) {
-    auto candidate = buildCandidate(start, goal_pose, duration, stamp);
-    if (!candidate.has_value()) {
-      continue;
-    }
-    std::string reason;
-    if (!satisfiesKinematicConstraints(*candidate, &reason)) {
-      if (failure_reason) {
-        std::ostringstream oss;
-        oss << "duration=" << duration << "s: " << reason;
-        *failure_reason = oss.str();
+  // Logged on every failure below -- a large mismatch here, relative to
+  // `distance`, is a direct signal that the goal requires a turn tighter
+  // than a single quintic segment (or this vehicle) can deliver, as opposed
+  // to a threshold-tuning problem. Not used in any feasibility decision.
+  double start_yaw = yawFromQuaternion(start.pose.orientation);
+  double goal_yaw = yawFromQuaternion(goal_pose.orientation);
+  double heading_delta = goal_yaw - start_yaw;
+  while (heading_delta > M_PI) heading_delta -= 2.0 * M_PI;
+  while (heading_delta < -M_PI) heading_delta += 2.0 * M_PI;
+
+  // Outer loop: try increasingly wide Dubins turn radii, tightest first.
+  // Inner loop: for each radius, try increasing durations starting from the
+  // distance-based estimate. Both dimensions genuinely matter and neither
+  // alone reliably finds a feasible candidate -- see
+  // path_turn_radius_step's docs for why radius isn't just fixed at the
+  // tightest safe value.
+  for (double turn_radius = params_.min_path_turn_radius;
+       turn_radius <= params_.max_path_turn_radius;
+       turn_radius += params_.path_turn_radius_step) {
+    for (double duration = initial_guess; duration <= params_.max_duration;
+         duration += params_.duration_step) {
+      auto candidate = buildCandidate(start, goal_pose, turn_radius, duration, stamp);
+      if (!candidate.has_value()) {
+        continue;
       }
-      continue;
-    }
-    if (!isCollisionFree(*candidate, objects, stamp, &reason)) {
-      if (failure_reason) {
-        std::ostringstream oss;
-        oss << "duration=" << duration << "s: " << reason;
-        *failure_reason = oss.str();
+      std::string reason;
+      if (!satisfiesKinematicConstraints(*candidate, &reason)) {
+        if (failure_reason) {
+          std::ostringstream oss;
+          oss << "radius=" << turn_radius << "m duration=" << duration << "s: " << reason
+              << " [start=(" << start.pose.position.x << "," << start.pose.position.y << ","
+              << start_yaw << "rad,v=" << start.speed << ") goal=(" << goal_pose.position.x << ","
+              << goal_pose.position.y << "," << goal_yaw << "rad) heading_delta=" << heading_delta
+              << "rad distance=" << distance << "m]";
+          *failure_reason = oss.str();
+        }
+        continue;
       }
-      continue;
+      if (!isCollisionFree(*candidate, objects, stamp, &reason)) {
+        if (failure_reason) {
+          std::ostringstream oss;
+          oss << "radius=" << turn_radius << "m duration=" << duration << "s: " << reason;
+          *failure_reason = oss.str();
+        }
+        continue;
+      }
+      return candidate;
     }
-    return candidate;
   }
   return std::nullopt;
 }
