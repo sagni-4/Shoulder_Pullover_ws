@@ -70,6 +70,14 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     declare_parameter<double>("weight_continuity", scorer_params_.weight_continuity);
   scorer_params_.weight_curvature =
     declare_parameter<double>("weight_curvature", scorer_params_.weight_curvature);
+  scorer_params_.weight_maneuver_ease =
+    declare_parameter<double>("weight_maneuver_ease", scorer_params_.weight_maneuver_ease);
+  scorer_params_.weight_jerk_ease =
+    declare_parameter<double>("weight_jerk_ease", scorer_params_.weight_jerk_ease);
+  scorer_params_.max_maneuver_curvature =
+    declare_parameter<double>("max_maneuver_curvature", scorer_params_.max_maneuver_curvature);
+  scorer_params_.max_maneuver_jerk =
+    declare_parameter<double>("max_maneuver_jerk", scorer_params_.max_maneuver_jerk);
 
   // --- Parameters: trajectory planning --------------------------------------
   trajectory_params_.dt = declare_parameter<double>("trajectory_dt", trajectory_params_.dt);
@@ -478,9 +486,11 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
   RCLCPP_INFO(
     get_logger(),
     "Selected shoulder goal at (%.2f, %.2f): score=%.3f distance=%.1fm curvature=%.4f "
-    "continuity=%.1fm. Starting standalone trajectory planner (replanning at %.1f Hz).",
+    "continuity=%.1fm maneuver_curvature=%.4f maneuver_initial_jerk=%.3f. Starting standalone "
+    "trajectory planner (replanning at %.1f Hz).",
     goal->pose.position.x, goal->pose.position.y, goal->score, goal->distance_from_ego,
-    goal->curvature, goal->continuity_length, planning_rate_hz_);
+    goal->curvature, goal->continuity_length, goal->maneuver_curvature,
+    goal->maneuver_initial_jerk, planning_rate_hz_);
 
   active_goal_ = goal->pose;
   consecutive_planning_failures_ = 0;

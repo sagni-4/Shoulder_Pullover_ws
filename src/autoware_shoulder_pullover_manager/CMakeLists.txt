@@ -24,6 +24,7 @@ find_package(visualization_msgs REQUIRED)
 add_library(shoulder_pullover_manager_lib
   src/goal_scorer.cpp
   src/dubins_path.cpp
+  src/curvature_spiral_path.cpp
   src/trajectory_planner.cpp
   src/keyboard_trigger.cpp
   src/pull_over_manager_node.cpp

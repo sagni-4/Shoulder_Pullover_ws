@@ -113,15 +113,45 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
       continue;  // Not enough confirmed shoulder ahead of this point yet.
     }
 
+    // Maneuver feasibility from ego's actual current pose -- see class
+    // docs for why this is checked here rather than left entirely to
+    // PullOverTrajectoryPlanner. Deliberately the same shape generator
+    // (CurvatureSpiralPath) and the same cap (max_maneuver_curvature
+    // should match trajectory_planner's max_curvature) -- a candidate
+    // this rejects would be rejected by the planner's own preferred shape
+    // too, just discovered late instead of up front.
+    const CurvatureSpiralPath maneuver(
+      ego_pose, centerline_map.poses[i].pose, params_.max_maneuver_curvature);
+    if (!maneuver.valid()) {
+      continue;
+    }
+
+    // A *separate* gate from the curvature one above -- see
+    // weight_jerk_ease's docs for why peak curvature alone isn't enough.
+    // Approximate (speed close to ego_speed_mps still holds at the
+    // maneuver's very start, per PullOverTrajectoryPlanner's a0=0
+    // boundary condition), not an exact replica of the discretized check.
+    const double estimated_initial_jerk =
+      ego_speed_mps * ego_speed_mps * ego_speed_mps * maneuver.initialCurvatureRate();
+    if (std::abs(estimated_initial_jerk) > params_.max_maneuver_jerk) {
+      continue;
+    }
+
     const double curvature = estimateCurvature(centerline_map, i);
 
     const double continuity_norm =
       std::clamp(continuity_length / params_.reference_run_length, 0.0, 1.0);
     const double curvature_norm =
       std::clamp(curvature / params_.max_reference_curvature, 0.0, 1.0);
+    const double maneuver_norm =
+      std::clamp(maneuver.peakCurvature() / params_.max_maneuver_curvature, 0.0, 1.0);
+    const double jerk_norm =
+      std::clamp(std::abs(estimated_initial_jerk) / params_.max_maneuver_jerk, 0.0, 1.0);
 
     const double score = params_.weight_continuity * continuity_norm +
-                          params_.weight_curvature * (1.0 - curvature_norm);
+                          params_.weight_curvature * (1.0 - curvature_norm) +
+                          params_.weight_maneuver_ease * (1.0 - maneuver_norm) +
+                          params_.weight_jerk_ease * (1.0 - jerk_norm);
 
     if (!best.has_value() || score > best->score) {
       ScoredCandidate candidate;
@@ -130,6 +160,8 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
       candidate.distance_from_ego = distance;
       candidate.curvature = curvature;
       candidate.continuity_length = continuity_length;
+      candidate.maneuver_curvature = maneuver.peakCurvature();
+      candidate.maneuver_initial_jerk = estimated_initial_jerk;
       best = candidate;
     }
   }

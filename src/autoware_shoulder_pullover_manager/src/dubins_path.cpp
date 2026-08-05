@@ -135,7 +135,7 @@ DubinsPath::DubinsPath(
   valid_ = true;
 }
 
-DubinsPath::PathPoint DubinsPath::pointAt(double s) const
+PathPoint DubinsPath::pointAt(double s) const
 {
   s = std::clamp(s, 0.0, length_);
   double x = start_x_;

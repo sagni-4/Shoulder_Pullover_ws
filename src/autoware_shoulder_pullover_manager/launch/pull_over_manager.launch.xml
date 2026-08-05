@@ -26,8 +26,12 @@
   <arg name="min_continuity_length" default="8.0"/>
   <arg name="reference_run_length" default="20.0"/>
   <arg name="max_reference_curvature" default="0.3"/>
-  <arg name="weight_continuity" default="0.6"/>
-  <arg name="weight_curvature" default="0.4"/>
+  <arg name="weight_continuity" default="0.4"/>
+  <arg name="weight_curvature" default="0.2"/>
+  <arg name="weight_maneuver_ease" default="0.2" description="Score weight for preferring goals reachable via a gentler required maneuver from ego's current pose -- added 2026-08-05 after live testing found GoalScorer kept picking top-scored goals the trajectory planner could not safely reach"/>
+  <arg name="weight_jerk_ease" default="0.2" description="Score weight for preferring goals with a gentler required initial curvature ramp at ego's *current speed* -- a separate concern from weight_maneuver_ease since jerk scales with speed cubed, so a goal can pass the curvature gate yet still jerk-violate while moving"/>
+  <arg name="max_maneuver_curvature" default="0.27" description="1/m -- must match trajectory_max_curvature below, both derived from this vehicle's real steering kinematics"/>
+  <arg name="max_maneuver_jerk" default="3.0" description="m/s^3 -- must match trajectory_max_lateral_jerk below"/>
 
   <arg name="trajectory_dt" default="0.1"/>
   <arg name="trajectory_min_duration" default="2.0"/>
@@ -73,6 +77,10 @@
     <param name="max_reference_curvature" value="$(var max_reference_curvature)"/>
     <param name="weight_continuity" value="$(var weight_continuity)"/>
     <param name="weight_curvature" value="$(var weight_curvature)"/>
+    <param name="weight_maneuver_ease" value="$(var weight_maneuver_ease)"/>
+    <param name="weight_jerk_ease" value="$(var weight_jerk_ease)"/>
+    <param name="max_maneuver_curvature" value="$(var max_maneuver_curvature)"/>
+    <param name="max_maneuver_jerk" value="$(var max_maneuver_jerk)"/>
     <param name="trajectory_dt" value="$(var trajectory_dt)"/>
     <param name="trajectory_min_duration" value="$(var trajectory_min_duration)"/>
     <param name="trajectory_max_duration" value="$(var trajectory_max_duration)"/>
