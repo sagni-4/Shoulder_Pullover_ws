@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoware_shoulder_pullover_manager</name>
+  <version>0.1.0</version>
+  <description>
+    Fills Autoware's reserved-but-unimplemented "pull_over" MRM extension
+    point (see /system/mrm/pull_over_manager/{operate,status}, already
+    wired as a client by autoware_mrm_handler but never served). Scores
+    candidate goals along the live shoulder_centerline_path_map, then plans
+    its own standalone, collision-checked trajectory directly to the goal --
+    Autoware's mission_planner cannot route there since the target shoulder
+    area has no Lanelet2 representation in this project's map at all. A
+    raw-terminal 'P' keypress is provided as a stand-in trigger until a real
+    MRM/diagnostics-driven trigger is wired up.
+  </description>
+  <maintainer email="dev@example.com">dev</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>autoware_adapi_v1_msgs</depend>
+  <depend>autoware_common_msgs</depend>
+  <depend>autoware_perception_msgs</depend>
+  <depend>autoware_planning_msgs</depend>
+  <depend>tier4_system_msgs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

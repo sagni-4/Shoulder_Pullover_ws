@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="centerline_topic" default="/shoulder_centerline_node/shoulder_centerline_path_map" description="Map-frame, accumulating shoulder centerline path (nav_msgs/Path) published by shoulder_centerline_node in shoulder_detection_ws"/>
+  <arg name="odometry_topic" default="/localization/kinematic_state" description="Ego pose+twist, map frame"/>
+  <arg name="objects_topic" default="/perception/object_recognition/objects" description="autoware_perception_msgs/PredictedObjects, used for the trajectory planner's collision check"/>
+
+  <arg name="require_autonomous_mode" default="true" description="Refuse to trigger unless /api/operation_mode/state reports AUTONOMOUS -- prevents planning a maneuver while the vehicle is not under Autoware's driving control"/>
+
+  <arg name="keyboard_trigger_enabled" default="true" description="Simulated MRM trigger for development: press this key in the node's launch terminal. Only active if stdin is a TTY. The real trigger path (tier4_system_msgs/srv/OperateMrm on /system/mrm/pull_over_manager/operate) is always active regardless of this flag -- this is purely an additional, convenient stand-in until a real diagnostics-driven MRM condition is wired up."/>
+  <arg name="keyboard_trigger_key" default="p"/>
+
+  <arg name="status_publish_rate_hz" default="5.0"/>
+  <arg name="poll_rate_hz" default="20.0" description="Rate at which the keyboard-trigger flag is drained on the executor thread"/>
+  <arg name="planning_rate_hz" default="10.0" description="Receding-horizon replanning rate while a maneuver is in progress"/>
+
+  <arg name="arrival_distance_threshold" default="1.0" description="Meters from goal to declare the maneuver succeeded"/>
+  <arg name="arrival_speed_threshold" default="0.2" description="m/s below which ego is considered stopped for arrival purposes"/>
+  <arg name="max_consecutive_planning_failures" default="30" description="Consecutive cycles with no feasible/collision-free trajectory before giving up and reporting failure"/>
+
+  <arg name="direct_trajectory_output_topic" default="" description="DANGER if misused: when non-empty, this node ALSO publishes its planned trajectory directly on this topic name every planning cycle while operating. Only set this to the live control-facing trajectory topic (e.g. /planning/trajectory) if planning_validator's own output has been remapped away from that name first -- otherwise two publishers race on the same topic while the vehicle may be under autonomous control. Leave empty (default) to only publish on this node's own debug topics."/>
+
+  <arg name="max_lookahead_distance" default="60.0"/>
+  <arg name="comfortable_deceleration" default="2.0"/>
+  <arg name="stopping_margin" default="5.0"/>
+  <arg name="max_continuity_gap" default="3.0"/>
+  <arg name="min_continuity_length" default="8.0"/>
+  <arg name="reference_run_length" default="20.0"/>
+  <arg name="max_reference_curvature" default="0.3"/>
+  <arg name="weight_continuity" default="0.6"/>
+  <arg name="weight_curvature" default="0.4"/>
+
+  <arg name="trajectory_dt" default="0.1"/>
+  <arg name="trajectory_min_duration" default="2.0"/>
+  <arg name="trajectory_max_duration" default="15.0"/>
+  <arg name="trajectory_duration_step" default="1.0"/>
+  <arg name="trajectory_terminal_approach_speed" default="0.3"/>
+  <arg name="trajectory_max_curvature" default="0.5" description="1/m -- conservative vs. planning_validator's own ~1.0 hard limit"/>
+  <arg name="trajectory_max_lateral_accel" default="2.5" description="m/s^2 -- conservative vs. planning_validator's 9.8 hard limit"/>
+  <arg name="trajectory_max_lateral_jerk" default="3.0" description="m/s^3 -- conservative vs. planning_validator's 7.0 hard limit"/>
+  <arg name="trajectory_max_longitudinal_accel" default="1.5"/>
+  <arg name="trajectory_min_longitudinal_accel" default="-2.5"/>
+  <arg name="trajectory_ego_footprint_radius" default="1.5" description="Circular over-approximation of the ego footprint (m) for collision checking"/>
+  <arg name="trajectory_default_object_radius" default="1.0"/>
+  <arg name="trajectory_collision_margin" default="1.0"/>
+
+  <node pkg="autoware_shoulder_pullover_manager" exec="shoulder_pullover_manager_node" name="shoulder_pullover_manager" output="screen">
+    <param name="centerline_topic" value="$(var centerline_topic)"/>
+    <param name="odometry_topic" value="$(var odometry_topic)"/>
+    <param name="objects_topic" value="$(var objects_topic)"/>
+    <param name="require_autonomous_mode" value="$(var require_autonomous_mode)"/>
+    <param name="keyboard_trigger_enabled" value="$(var keyboard_trigger_enabled)"/>
+    <param name="keyboard_trigger_key" value="$(var keyboard_trigger_key)"/>
+    <param name="status_publish_rate_hz" value="$(var status_publish_rate_hz)"/>
+    <param name="poll_rate_hz" value="$(var poll_rate_hz)"/>
+    <param name="planning_rate_hz" value="$(var planning_rate_hz)"/>
+    <param name="arrival_distance_threshold" value="$(var arrival_distance_threshold)"/>
+    <param name="arrival_speed_threshold" value="$(var arrival_speed_threshold)"/>
+    <param name="max_consecutive_planning_failures" value="$(var max_consecutive_planning_failures)"/>
+    <param name="direct_trajectory_output_topic" value="$(var direct_trajectory_output_topic)"/>
+    <param name="max_lookahead_distance" value="$(var max_lookahead_distance)"/>
+    <param name="comfortable_deceleration" value="$(var comfortable_deceleration)"/>
+    <param name="stopping_margin" value="$(var stopping_margin)"/>
+    <param name="max_continuity_gap" value="$(var max_continuity_gap)"/>
+    <param name="min_continuity_length" value="$(var min_continuity_length)"/>
+    <param name="reference_run_length" value="$(var reference_run_length)"/>
+    <param name="max_reference_curvature" value="$(var max_reference_curvature)"/>
+    <param name="weight_continuity" value="$(var weight_continuity)"/>
+    <param name="weight_curvature" value="$(var weight_curvature)"/>
+    <param name="trajectory_dt" value="$(var trajectory_dt)"/>
+    <param name="trajectory_min_duration" value="$(var trajectory_min_duration)"/>
+    <param name="trajectory_max_duration" value="$(var trajectory_max_duration)"/>
+    <param name="trajectory_duration_step" value="$(var trajectory_duration_step)"/>
+    <param name="trajectory_terminal_approach_speed" value="$(var trajectory_terminal_approach_speed)"/>
+    <param name="trajectory_max_curvature" value="$(var trajectory_max_curvature)"/>
+    <param name="trajectory_max_lateral_accel" value="$(var trajectory_max_lateral_accel)"/>
+    <param name="trajectory_max_lateral_jerk" value="$(var trajectory_max_lateral_jerk)"/>
+    <param name="trajectory_max_longitudinal_accel" value="$(var trajectory_max_longitudinal_accel)"/>
+    <param name="trajectory_min_longitudinal_accel" value="$(var trajectory_min_longitudinal_accel)"/>
+    <param name="trajectory_ego_footprint_radius" value="$(var trajectory_ego_footprint_radius)"/>
+    <param name="trajectory_default_object_radius" value="$(var trajectory_default_object_radius)"/>
+    <param name="trajectory_collision_margin" value="$(var trajectory_collision_margin)"/>
+  </node>
+</launch>
