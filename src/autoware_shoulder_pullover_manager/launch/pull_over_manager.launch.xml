@@ -34,7 +34,10 @@
   <arg name="trajectory_max_duration" default="15.0"/>
   <arg name="trajectory_duration_step" default="1.0"/>
   <arg name="trajectory_terminal_approach_speed" default="0.3"/>
-  <arg name="trajectory_max_curvature" default="0.8" description="1/m -- conservative vs. planning_validator's own ~1.0 hard limit"/>
+  <arg name="trajectory_min_path_turn_radius" default="4.0" description="m -- tightest DubinsPath turning radius tried; curvature=0.25 1/m, under the real vehicle kinematic limit (~0.302 1/m, see trajectory_max_curvature)"/>
+  <arg name="trajectory_max_path_turn_radius" default="15.0" description="m -- widest turning radius tried before giving up on a goal entirely"/>
+  <arg name="trajectory_path_turn_radius_step" default="0.25" description="m -- increment between tried radii; searched (not fixed) because feasibility is non-monotonic in radius, see trajectory_planner.hpp"/>
+  <arg name="trajectory_max_curvature" default="0.27" description="1/m -- derived from this vehicle's real steering kinematics (wheel_base=2.79m, max_steer_angle=0.70rad -> ~0.302 1/m hard limit), NOT from planning_validator's generic ~1.0 sanity-check threshold. Now mostly a redundant safety net since the DubinsPath shape bounds curvature by construction -- see trajectory_planner.hpp for the full story of why the old 0.8 default was wrong."/>
   <arg name="trajectory_min_speed_for_curvature_check" default="0.15" description="m/s -- below this speed, curvature/lateral-accel/lateral-jerk checks are skipped (numerically ill-conditioned near a stop; a near-stationary vehicle can point its wheels sharply with zero real risk)"/>
   <arg name="trajectory_max_lateral_accel" default="2.5" description="m/s^2 -- conservative vs. planning_validator's 9.8 hard limit"/>
   <arg name="trajectory_max_lateral_jerk" default="3.0" description="m/s^3 -- conservative vs. planning_validator's 7.0 hard limit"/>
@@ -75,6 +78,9 @@
     <param name="trajectory_max_duration" value="$(var trajectory_max_duration)"/>
     <param name="trajectory_duration_step" value="$(var trajectory_duration_step)"/>
     <param name="trajectory_terminal_approach_speed" value="$(var trajectory_terminal_approach_speed)"/>
+    <param name="trajectory_min_path_turn_radius" value="$(var trajectory_min_path_turn_radius)"/>
+    <param name="trajectory_max_path_turn_radius" value="$(var trajectory_max_path_turn_radius)"/>
+    <param name="trajectory_path_turn_radius_step" value="$(var trajectory_path_turn_radius_step)"/>
     <param name="trajectory_max_curvature" value="$(var trajectory_max_curvature)"/>
     <param name="trajectory_min_speed_for_curvature_check" value="$(var trajectory_min_speed_for_curvature_check)"/>
     <param name="trajectory_max_lateral_accel" value="$(var trajectory_max_lateral_accel)"/>
