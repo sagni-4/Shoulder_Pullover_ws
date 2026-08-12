@@ -2,7 +2,7 @@
   <!--
     Reloads planning_validator into its existing, already-running component
     container with ONLY its trajectory input remapped to
-    pullover_trajectory_gate's output -- everything else (all other remaps,
+    pullover_trajectory_gate's output; everything else (all other remaps,
     all param files, vehicle_info) is copied byte-for-byte from
     autoware_planning_validator/launch/planning_validator.launch.xml so this
     is a like-for-like swap, not a fresh reconfiguration.
@@ -23,14 +23,14 @@
            ros2 launch autoware_shoulder_pullover_manager reload_planning_validator_via_gate.launch.xml
       5. Verify: `ros2 node list | grep planning_validator` should show
          exactly `/planning/planning_validator` (NOT `/planning_validator`
-         with no namespace -- that happened once and indicates the
+         with no namespace; that happened once and indicates the
          namespace attribute below got dropped/ignored, which can confuse
          Autoware's own diagnostics even though data flow is unaffected).
          `ros2 topic hz /planning/trajectory` should resume at its normal
          rate.
 
     This has to be redone (steps 2-4) every time the underlying Autoware
-    launch stack is restarted -- it is NOT persisted anywhere in the normal
+    launch stack is restarted; it is NOT persisted anywhere in the normal
     launch tree, deliberately, since editing autoware_launch's own files
     was considered more invasive than this live reload.
   -->

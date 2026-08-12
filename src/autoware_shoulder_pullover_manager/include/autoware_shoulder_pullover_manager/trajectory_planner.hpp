@@ -20,6 +20,15 @@ struct KinematicState
 {
   geometry_msgs::msg::Pose pose;
   double speed{0.0};  ///< Signed forward speed (m/s), from odometry.
+  /// Seed for the *start* acceleration boundary condition (a0) of the next
+  /// quintic solve, m/s^2. Deliberately NOT a live sensor reading (see
+  /// buildCandidate's docs for why that was rejected) -- callers should
+  /// derive this from the previously-*commanded* trajectory's own predicted
+  /// acceleration at the current time, not from odometry/IMU. Defaults to
+  /// 0.0, which reproduces the original always-zero behavior for any caller
+  /// that doesn't set it (e.g. a first-ever call with no prior trajectory to
+  /// warm-start from).
+  double accel{0.0};
 };
 
 /// Tunable limits for PullOverTrajectoryPlanner. Defaults are deliberately

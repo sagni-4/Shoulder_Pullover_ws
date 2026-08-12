@@ -22,6 +22,7 @@
   <arg name="direct_trajectory_output_topic" default="" description="DANGER if misused: when non-empty, this node ALSO publishes its planned trajectory directly on this topic name every planning cycle while operating. Only set this to the live control-facing trajectory topic (e.g. /planning/trajectory) if planning_validator's own output has been remapped away from that name first -- otherwise two publishers race on the same topic while the vehicle may be under autonomous control. Leave empty (default) to only publish on this node's own debug topics."/>
 
   <arg name="max_lookahead_distance" default="60.0"/>
+  <arg name="min_maneuver_forward_progress" default="2.0" description="m -- minimum forward-projected (along ego's current heading) distance a candidate must offer, distinct from straight-line max_lookahead_distance above. Rejects near-degenerate 'almost pure sidestep' goals (large lateral offset, vanishing forward room) whose required curvature is hypersensitive to ego's exact pose -- live-tested root cause 2026-08-10, see goal_scorer.hpp."/>
   <arg name="comfortable_deceleration" default="2.0"/>
   <arg name="stopping_margin" default="5.0"/>
   <arg name="max_continuity_gap" default="3.0"/>
@@ -73,6 +74,7 @@
     <param name="deceleration_giveup_speed_threshold" value="$(var deceleration_giveup_speed_threshold)"/>
     <param name="direct_trajectory_output_topic" value="$(var direct_trajectory_output_topic)"/>
     <param name="max_lookahead_distance" value="$(var max_lookahead_distance)"/>
+    <param name="min_maneuver_forward_progress" value="$(var min_maneuver_forward_progress)"/>
     <param name="comfortable_deceleration" value="$(var comfortable_deceleration)"/>
     <param name="stopping_margin" value="$(var stopping_margin)"/>
     <param name="max_continuity_gap" value="$(var max_continuity_gap)"/>

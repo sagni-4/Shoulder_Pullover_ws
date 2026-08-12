@@ -45,6 +45,31 @@ struct GoalScorerParams
   /// from a completely different part of the accumulated map-frame trail.
   double max_lookahead_distance{60.0};
 
+  /// Minimum forward-projected distance (meters, along ego's *current*
+  /// heading) a candidate must offer -- **not** the same as the
+  /// straight-line `distance` used for max_lookahead_distance above; this
+  /// is that same vector's component specifically along ego's forward
+  /// direction. Live-tested root cause (2026-08-10): a candidate can have a
+  /// perfectly reasonable straight-line distance (e.g. 6.6m) while being
+  /// almost entirely *lateral* offset with only a sliver of forward room
+  /// (e.g. 0.2-0.4m) -- CurvatureSpiralPath's required curvature blows up
+  /// as forward distance shrinks toward zero for a fixed lateral offset (a
+  /// genuine geometric near-singularity, not a solver bug), so such a goal
+  /// can read as comfortably feasible (e.g. curvature 0.25, under the 0.27
+  /// cap) at the exact instant GoalScorer checks it, then become wildly
+  /// infeasible (curvature 0.7+) just 1-3 planning cycles later once ego
+  /// has moved even slightly -- because `PullOverTrajectoryPlanner::plan()`
+  /// re-derives the maneuver shape from ego's *current* pose every single
+  /// cycle, but nothing ever re-validates that a goal fixed into
+  /// `active_goal_` stays reachable as that pose evolves. Rejecting
+  /// near-zero-forward-progress candidates outright (rather than trying to
+  /// out-guess the singularity with a curvature safety margin, which would
+  /// still be fragile right up to wherever the new margin's edge is) closes
+  /// this at the source: a goal needing 6.5m of lateral movement in under 2m
+  /// of forward room is a fragile "almost pure sidestep" no matter how
+  /// gently it scores at any one instant.
+  double min_maneuver_forward_progress{2.0};
+
   /// Comfortable deceleration (m/s^2) used to compute the minimum feasible
   /// stopping distance at the vehicle's current speed. Matches the order of
   /// magnitude Autoware's own comfortable_stop MRM behavior targets.

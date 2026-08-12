@@ -137,11 +137,33 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   const KinematicState & start, const PathShape & shape,
   const geometry_msgs::msg::Pose & goal_pose, double duration, const rclcpp::Time & stamp) const
 {
-  // Deliberately zero start/goal acceleration: injecting a noisy live
-  // acceleration estimate as a hard boundary condition risks a
-  // poorly-conditioned fit more than it helps -- see class-level docs.
+  // Terminal acceleration is still hardcoded zero: each individual candidate
+  // should settle smoothly by its own end regardless of how it started, and
+  // that boundary is never re-examined mid-flight the way the start one is.
   constexpr double kZeroAccel = 0.0;
 
+  // Start acceleration comes from `start.accel`, NOT a live sensor reading
+  // (see KinematicState::accel's docs) -- a raw IMU/odometry-derived
+  // acceleration estimate was deliberately rejected as a hard boundary
+  // condition (too noisy, risks a poorly-conditioned fit). But hardcoding
+  // it to zero on *every* 100ms replanning cycle turned out to have its own,
+  // worse failure mode, found live 2026-08-10: a minimum-jerk profile
+  // starting from a0=0 necessarily has near-zero acceleration for the first
+  // slice of its own duration by construction, and since a fresh multi-second
+  // candidate is solved from scratch every single cycle, the vehicle only
+  // ever lives through that first, deliberately-gentlest slice before it's
+  // discarded and replaced -- the larger acceleration/deceleration any given
+  // candidate *would* command several seconds in is never reached in
+  // practice. Verified live: ego stuck at exactly 0.0 m/s for 480+
+  // consecutive seconds, 4.6m short of goal, while a validly-shaped
+  // accelerate-then-decelerate trajectory was successfully replanned and
+  // published every cycle the entire time. Fix: the caller (see
+  // PullOverManagerNode::seedAccelerationFromLastTrajectory) passes in the
+  // *previously-commanded* trajectory's own predicted acceleration at "now"
+  // -- a model-based warm start, not a new noise source -- so real
+  // acceleration can actually accumulate across cycles instead of
+  // re-zeroing every time.
+  //
   // *Speed* along the (already-built, already-validated) fixed shape: a
   // scalar minimum-jerk quintic over arc length s, from the vehicle's
   // current speed to a small nonzero terminal approach speed (keeps the
@@ -150,7 +172,7 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   // for an explicit stop point -- see the framework report's
   // control/validation contract section).
   const Quintic qs = solveQuintic(
-    0.0, start.speed, kZeroAccel, shape.length(), params_.terminal_approach_speed, kZeroAccel,
+    0.0, start.speed, start.accel, shape.length(), params_.terminal_approach_speed, kZeroAccel,
     duration);
 
   Trajectory trajectory;
@@ -160,11 +182,64 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   const int num_samples = std::max(2, static_cast<int>(std::round(duration / params_.dt)) + 1);
   trajectory.points.reserve(static_cast<std::size_t>(num_samples));
 
+  // Live-verified crash (2026-08-10): the [0, shape.length()] clamp below is
+  // only meant as floating-point-noise defense (see the comment on it), but
+  // with a genuinely nonzero start.accel (see the warm-start docs above) a
+  // quintic solved from a small v0 and a meaningfully negative a0 can
+  // legitimately dip *below* s=0 for real, for more than one sample near
+  // t=0 -- not noise. Clamping those all to exactly 0.0 silently produces
+  // several consecutive trajectory points at the identical position, which
+  // is fine for this planner's own checks but crashed a downstream Autoware
+  // component outright (autoware_interpolation:
+  // `std::invalid_argument("Either base_keys or query_keys is not
+  // sorted.")`, uncaught, took down the whole /control/control_container --
+  // vehicle_cmd_gate and the actual controller included -- mid-maneuver).
+  // Physically, arc length along a forward path should never run backward
+  // or stall mid-maneuver like this anyway (that's what kDecelerating is
+  // for), so reject any candidate whose *raw, unclamped* position ever
+  // drops meaningfully below 0 rather than silently repairing it -- the
+  // existing duration search above already tries the next candidate.
+  constexpr double kMinRawPosition = -1e-3;
+  for (int i = 0; i < num_samples; ++i) {
+    const double t_check = std::min(duration, i * params_.dt);
+    if (qs.position(t_check) < kMinRawPosition) {
+      return std::nullopt;
+    }
+  }
+
+  // Second, independent guard for the SAME downstream crash (live-verified
+  // recurring 2026-08-12, after the reactive controller-departure fix in
+  // PullOverManagerNode finally let a real v0=0 departure happen for the
+  // first time -- this exact non-strictly-increasing-arc-length input had
+  // never actually reached a downstream Autoware component before that,
+  // since the vehicle never used to depart at all). The negative-dip check
+  // above only catches a meaningfully *negative* raw position from a
+  // nonzero start acceleration; it says nothing about a genuine v0=0, a0=0
+  // start, whose quintic is flat (zero position, slope, and curvature) at
+  // t=0 by construction -- the position for the first several samples can
+  // be a real, non-negative, but vanishingly small number, clamping to
+  // *arc-length* increments too small to trust as physically meaningful
+  // forward progress even though they're technically nonzero doubles.
+  // Reject outright (search moves on to the next candidate) rather than
+  // silently accept -- same policy as the check above, for the same reason.
+  constexpr double kMinArcLengthStep = 1e-4;  // 0.1mm; below this, don't trust it as real progress.
+  double previous_s = std::clamp(qs.position(0.0), 0.0, shape.length());
+  for (int i = 1; i < num_samples; ++i) {
+    const double t_check = std::min(duration, i * params_.dt);
+    const double s = std::clamp(qs.position(t_check), 0.0, shape.length());
+    if (s - previous_s < kMinArcLengthStep) {
+      return std::nullopt;
+    }
+    previous_s = s;
+  }
+
   for (int i = 0; i < num_samples; ++i) {
     const bool is_last = (i + 1 == num_samples);
     const double t = std::min(duration, i * params_.dt);
-    // Clamped defensively; solveQuintic's boundary conditions already put
-    // s(duration) == shape.length() exactly, up to floating-point error.
+    // Clamped defensively for floating-point noise only now that the
+    // meaningful-dip case above is rejected outright -- solveQuintic's
+    // boundary conditions already put s(duration) == shape.length()
+    // exactly, up to floating-point error.
     const double s = std::clamp(qs.position(t), 0.0, shape.length());
     const PathPoint path_point = shape.pointAt(s);
 

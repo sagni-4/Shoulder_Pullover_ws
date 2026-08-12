@@ -97,14 +97,16 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
       continue;  // Either unreachably far, or too close to decelerate comfortably.
     }
 
-    // Reject candidates that are not roughly ahead of the vehicle -- avoids
-    // selecting stale waypoints behind ego on the ever-accumulating
-    // map-frame trail.
+    // Reject candidates that are not meaningfully ahead of the vehicle --
+    // avoids selecting stale waypoints behind ego on the ever-accumulating
+    // map-frame trail, *and* (see min_maneuver_forward_progress's docs)
+    // near-degenerate "almost pure sidestep" candidates whose required
+    // curvature is hypersensitive to exactly how much forward room remains.
     const double to_candidate_x = candidate_position.x - ego_pose.position.x;
     const double to_candidate_y = candidate_position.y - ego_pose.position.y;
     const double forward_alignment =
       to_candidate_x * ego_forward_x + to_candidate_y * ego_forward_y;
-    if (forward_alignment <= 0.0) {
+    if (forward_alignment < params_.min_maneuver_forward_progress) {
       continue;
     }
 

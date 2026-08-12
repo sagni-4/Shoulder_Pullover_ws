@@ -54,6 +54,8 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   // --- Parameters: goal scoring --------------------------------------------
   scorer_params_.max_lookahead_distance =
     declare_parameter<double>("max_lookahead_distance", scorer_params_.max_lookahead_distance);
+  scorer_params_.min_maneuver_forward_progress = declare_parameter<double>(
+    "min_maneuver_forward_progress", scorer_params_.min_maneuver_forward_progress);
   scorer_params_.comfortable_deceleration = declare_parameter<double>(
     "comfortable_deceleration", scorer_params_.comfortable_deceleration);
   scorer_params_.stopping_margin =
@@ -138,6 +140,22 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   direct_trajectory_output_topic_ =
     declare_parameter<std::string>("direct_trajectory_output_topic", "");
 
+  // --- Parameters: controller STOPPED-state departure fix -------------------
+  // See pushControllerStopDistOverride()'s docs for the root cause this
+  // works around (autoware_pid_longitudinal_controller's departure_condition
+  // being unsatisfiable for a receding-horizon planner that legitimately
+  // starts each replan at ego's real, near-zero current speed).
+  controller_stop_dist_override_enabled_ =
+    declare_parameter<bool>("controller_stop_dist_override_enabled", true);
+  controller_node_name_ = declare_parameter<std::string>(
+    "controller_node_name", controller_node_name_);
+  controller_override_drive_state_stop_dist_ = declare_parameter<double>(
+    "controller_override_drive_state_stop_dist", controller_override_drive_state_stop_dist_);
+  controller_override_stuck_speed_threshold_ = declare_parameter<double>(
+    "controller_override_stuck_speed_threshold", controller_override_stuck_speed_threshold_);
+  controller_override_stuck_duration_ = declare_parameter<double>(
+    "controller_override_stuck_duration", controller_override_stuck_duration_);
+
   visualization_width_ = declare_parameter<double>("visualization_width", visualization_width_);
   visualization_alpha_ = declare_parameter<double>("visualization_alpha", visualization_alpha_);
 
@@ -155,6 +173,53 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   // --- Collaborators -------------------------------------------------------
   goal_scorer_ = std::make_unique<GoalScorer>(scorer_params_);
   trajectory_planner_ = std::make_unique<PullOverTrajectoryPlanner>(trajectory_params_);
+
+  if (controller_stop_dist_override_enabled_) {
+    controller_param_client_ =
+      std::make_shared<rclcpp::AsyncParametersClient>(this, controller_node_name_);
+    // Block briefly (constructor time, before spin() starts) until this
+    // client's DDS request writer has actually matched the controller's
+    // get_parameters service reader. Skipping this and firing get_parameters
+    // immediately is a classic silent-drop race: a request sent before
+    // endpoint matching completes is dropped with no error and no timeout,
+    // which is exactly what happened the first time this was live-tested --
+    // the capture callback below simply never fired, neither the success nor
+    // the failure branch.
+    if (!controller_param_client_->wait_for_service(std::chrono::seconds(5))) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Controller node '%s' parameter service not available after 5s at startup -- the "
+        "STOPPED-state departure override will stay disabled.",
+        controller_node_name_.c_str());
+    } else {
+      // Capture the live controller's own current drive_state_stop_dist once,
+      // at startup, as the value to restore to later -- deliberately not
+      // hardcoded to the launch-file default, in case some other override is
+      // already in effect for this stack. If the call fails, keep the
+      // built-in fallback (0.5, the stock default) and leave
+      // have_original_drive_state_stop_dist_ false so the override path logs
+      // a warning and refuses to act rather than silently overwriting a value
+      // it never actually confirmed.
+      controller_param_client_->get_parameters(
+        {"drive_state_stop_dist"},
+        [this](std::shared_future<std::vector<rclcpp::Parameter>> future) {
+          const auto params = future.get();
+          if (params.empty()) {
+            RCLCPP_WARN(
+              get_logger(),
+              "Could not read drive_state_stop_dist from '%s' at startup -- the "
+              "STOPPED-state departure override will stay disabled until this succeeds.",
+              controller_node_name_.c_str());
+            return;
+          }
+          original_drive_state_stop_dist_ = params.front().as_double();
+          have_original_drive_state_stop_dist_ = true;
+          RCLCPP_INFO(
+            get_logger(), "Captured original drive_state_stop_dist=%.3f from '%s'.",
+            original_drive_state_stop_dist_, controller_node_name_.c_str());
+        });
+    }
+  }
 
   if (keyboard_trigger_enabled_) {
     keyboard_trigger_ = std::make_unique<KeyboardTrigger>(
@@ -273,6 +338,9 @@ void PullOverManagerNode::onOperateMrm(
     state_ = ManagerState::kIdle;
     active_goal_.reset();
     deceleration_goal_.reset();
+    last_trajectory_.reset();
+    zero_speed_since_.reset();
+    restoreControllerStopDistOverride();
     response->response.success = true;
     response->response.message = "stood down";
     return;
@@ -383,6 +451,90 @@ void PullOverManagerNode::publishStatus()
   status_pub_->publish(status);
 }
 
+void PullOverManagerNode::pushControllerStopDistOverride()
+{
+  if (!controller_stop_dist_override_enabled_ || controller_override_active_) {
+    return;
+  }
+  if (!have_original_drive_state_stop_dist_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Skipping controller STOPPED-state departure override: original "
+      "drive_state_stop_dist was never successfully read from '%s'. The vehicle may stall "
+      "at 0.0 m/s if it comes to a stop mid-maneuver (see project notes on the "
+      "autoware_pid_longitudinal_controller STOPPED-state bug).",
+      controller_node_name_.c_str());
+    return;
+  }
+  controller_override_active_ = true;
+  controller_param_client_->set_parameters(
+    {rclcpp::Parameter(
+      "drive_state_stop_dist", controller_override_drive_state_stop_dist_)},
+    [this](std::shared_future<std::vector<rcl_interfaces::msg::SetParametersResult>> future) {
+      for (const auto & result : future.get()) {
+        if (!result.successful) {
+          RCLCPP_ERROR(
+            get_logger(), "Controller rejected drive_state_stop_dist override: %s",
+            result.reason.c_str());
+        }
+      }
+    });
+  RCLCPP_WARN(
+    get_logger(),
+    "Ego has been stuck below %.2f m/s for %.1fs mid-maneuver -- pushing "
+    "drive_state_stop_dist=%.3f to '%s' (was %.3f) to break the controller out of a latched "
+    "STOPPED state.",
+    controller_override_stuck_speed_threshold_, controller_override_stuck_duration_,
+    controller_override_drive_state_stop_dist_, controller_node_name_.c_str(),
+    original_drive_state_stop_dist_);
+}
+
+void PullOverManagerNode::restoreControllerStopDistOverride()
+{
+  if (!controller_override_active_) {
+    return;
+  }
+  controller_override_active_ = false;
+  controller_param_client_->set_parameters(
+    {rclcpp::Parameter("drive_state_stop_dist", original_drive_state_stop_dist_)},
+    [this](std::shared_future<std::vector<rcl_interfaces::msg::SetParametersResult>> future) {
+      for (const auto & result : future.get()) {
+        if (!result.successful) {
+          RCLCPP_ERROR(
+            get_logger(), "Controller rejected drive_state_stop_dist restore: %s",
+            result.reason.c_str());
+        }
+      }
+    });
+  RCLCPP_INFO(
+    get_logger(), "Restored drive_state_stop_dist=%.3f on '%s'.",
+    original_drive_state_stop_dist_, controller_node_name_.c_str());
+}
+
+void PullOverManagerNode::checkControllerStuckAndOverride(
+  double ego_speed, const rclcpp::Time & now)
+{
+  if (!controller_stop_dist_override_enabled_) {
+    return;
+  }
+  if (ego_speed >= controller_override_stuck_speed_threshold_) {
+    // Moving again (or never stuck) -- restoreControllerStopDistOverride()
+    // is itself a no-op if the override was never pushed, so it's safe to
+    // call unconditionally here every cycle.
+    zero_speed_since_.reset();
+    restoreControllerStopDistOverride();
+    return;
+  }
+  if (!zero_speed_since_.has_value()) {
+    zero_speed_since_ = now;
+    return;
+  }
+  const double stuck_duration = (now - *zero_speed_since_).seconds();
+  if (stuck_duration >= controller_override_stuck_duration_) {
+    pushControllerStopDistOverride();
+  }
+}
+
 void PullOverManagerNode::onPlanningTimer()
 {
   if (state_ != ManagerState::kDecelerating && state_ != ManagerState::kOperating) {
@@ -395,6 +547,8 @@ void PullOverManagerNode::onPlanningTimer()
   const auto & ego_pose = latest_odometry_->pose.pose;
   const double ego_speed = std::hypot(
     latest_odometry_->twist.twist.linear.x, latest_odometry_->twist.twist.linear.y);
+
+  checkControllerStuckAndOverride(ego_speed, now());
 
   if (state_ == ManagerState::kDecelerating) {
     // Re-check every cycle at the *current* (dropping) speed -- see
@@ -427,6 +581,7 @@ void PullOverManagerNode::onPlanningTimer()
         ego_speed);
       state_ = ManagerState::kFailed;
       deceleration_goal_.reset();
+      restoreControllerStopDistOverride();
       return;
     }
 
@@ -439,13 +594,15 @@ void PullOverManagerNode::onPlanningTimer()
       deceleration_goal_ = buildDecelerationGoal(ego_pose);
     }
 
+    const auto plan_stamp = now();
     KinematicState start;
     start.pose = ego_pose;
     start.speed = ego_speed;
+    start.accel = seedAccelerationFromLastTrajectory(plan_stamp);
 
     std::string failure_reason;
     const auto trajectory = trajectory_planner_->plan(
-      start, *deceleration_goal_, latest_objects_, now(), &failure_reason);
+      start, *deceleration_goal_, latest_objects_, plan_stamp, &failure_reason);
     if (!trajectory.has_value()) {
       RCLCPP_WARN(
         get_logger(), "No feasible in-lane braking trajectory found this cycle. Last reason: %s",
@@ -472,16 +629,19 @@ void PullOverManagerNode::onPlanningTimer()
       distance_to_goal, ego_speed);
     state_ = ManagerState::kSucceeded;
     active_goal_.reset();
+    restoreControllerStopDistOverride();
     return;
   }
 
+  const auto plan_stamp = now();
   KinematicState start;
   start.pose = ego_pose;
   start.speed = ego_speed;
+  start.accel = seedAccelerationFromLastTrajectory(plan_stamp);
 
   std::string failure_reason;
   const auto trajectory =
-    trajectory_planner_->plan(start, *active_goal_, latest_objects_, now(), &failure_reason);
+    trajectory_planner_->plan(start, *active_goal_, latest_objects_, plan_stamp, &failure_reason);
 
   if (!trajectory.has_value()) {
     ++consecutive_planning_failures_;
@@ -497,6 +657,7 @@ void PullOverManagerNode::onPlanningTimer()
         consecutive_planning_failures_);
       state_ = ManagerState::kFailed;
       active_goal_.reset();
+      restoreControllerStopDistOverride();
     }
     return;
   }
@@ -513,6 +674,9 @@ void PullOverManagerNode::publishTrajectory(const Trajectory & trajectory)
   if (trajectory_direct_pub_) {
     trajectory_direct_pub_->publish(trajectory);
   }
+  // Kept only to warm-start the next cycle's start-acceleration boundary
+  // condition -- see seedAccelerationFromLastTrajectory().
+  last_trajectory_ = trajectory;
 }
 
 geometry_msgs::msg::Pose PullOverManagerNode::buildDecelerationGoal(
@@ -523,6 +687,43 @@ geometry_msgs::msg::Pose PullOverManagerNode::buildDecelerationGoal(
   goal.position.x += deceleration_lookahead_distance_ * std::cos(yaw);
   goal.position.y += deceleration_lookahead_distance_ * std::sin(yaw);
   return goal;
+}
+
+double PullOverManagerNode::seedAccelerationFromLastTrajectory(const rclcpp::Time & now) const
+{
+  if (!last_trajectory_.has_value() || last_trajectory_->points.empty()) {
+    return 0.0;  // Nothing to warm-start from yet (first cycle of a fresh maneuver).
+  }
+
+  const double elapsed = (now - rclcpp::Time(last_trajectory_->header.stamp)).seconds();
+  if (elapsed < 0.0) {
+    return 0.0;  // Clock anomaly -- don't trust it.
+  }
+
+  const auto & points = last_trajectory_->points;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    const double t_i = rclcpp::Duration(points[i].time_from_start).seconds();
+    if (t_i < elapsed) {
+      continue;
+    }
+    if (i == 0) {
+      return static_cast<double>(points[0].acceleration_mps2);
+    }
+    const double t_prev = rclcpp::Duration(points[i - 1].time_from_start).seconds();
+    const double span = t_i - t_prev;
+    if (span <= 1e-6) {
+      return static_cast<double>(points[i].acceleration_mps2);
+    }
+    const double ratio = (elapsed - t_prev) / span;
+    const double a_prev = points[i - 1].acceleration_mps2;
+    const double a_i = points[i].acceleration_mps2;
+    return a_prev + ratio * (a_i - a_prev);
+  }
+
+  // elapsed is beyond that trajectory's own horizon entirely -- a missed
+  // cycle or genuinely stale state. Don't extrapolate past what that plan
+  // ever claimed; fall back to the safe default instead.
+  return 0.0;
 }
 
 // --- Core maneuver logic ---------------------------------------------------
@@ -536,6 +737,12 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
     RCLCPP_WARN(get_logger(), "%s", message.c_str());
     return {false, message};
   }
+
+  // Fresh trigger -- don't warm-start the new maneuver's acceleration
+  // boundary condition from a previous, unrelated maneuver's leftover
+  // trajectory (see seedAccelerationFromLastTrajectory()).
+  last_trajectory_.reset();
+  zero_speed_since_.reset();
 
   if (require_autonomous_mode_ && !autonomous_mode_engaged_) {
     const std::string message =
