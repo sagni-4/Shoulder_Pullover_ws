@@ -421,7 +421,7 @@ bool PullOverTrajectoryPlanner::isCollisionFree(
 std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
   const PredictedObjects & objects, const rclcpp::Time & stamp, std::string * failure_reason,
-  bool * blocked_by_traffic, const ShapeHint * preferred_hint, ShapeHint * used_hint) const
+  bool * blocked_by_traffic) const
 {
   if (blocked_by_traffic) {
     *blocked_by_traffic = false;
@@ -453,93 +453,49 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   // first one's diagnosis even when the *first* one is the interesting
   // one (e.g. spiral shape valid, only its own duration search failed --
   // live-tested, see project memory 2026-08-05).
-  // Single-candidate check, shared by the duration sweep below and the
-  // preferred_hint fast path -- factored out so both go through identical
-  // logic rather than risking the two drifting apart.
-  const auto tryOneCandidate = [&](
-                                  const PathShape & shape, double duration,
-                                  const std::string & shape_label,
-                                  std::string * out_reason) -> std::optional<Trajectory> {
-    auto candidate = buildCandidate(start, shape, goal_pose, duration, stamp);
-    if (!candidate.has_value()) {
-      return std::nullopt;
-    }
-    std::string reason;
-    if (!satisfiesKinematicConstraints(*candidate, &reason)) {
-      if (out_reason) {
-        std::ostringstream oss;
-        oss << shape_label << " duration=" << duration << "s: " << reason << " [start=("
-            << start.pose.position.x << "," << start.pose.position.y << "," << start_yaw
-            << "rad,v=" << start.speed << ") goal=(" << goal_pose.position.x << ","
-            << goal_pose.position.y << "," << goal_yaw << "rad) heading_delta=" << heading_delta
-            << "rad distance=" << distance << "m]";
-        *out_reason = oss.str();
-      }
-      return std::nullopt;
-    }
-    if (!isCollisionFree(*candidate, objects, stamp, &reason)) {
-      if (out_reason) {
-        std::ostringstream oss;
-        oss << shape_label << " duration=" << duration << "s: " << reason;
-        *out_reason = oss.str();
-      }
-      if (blocked_by_traffic) {
-        *blocked_by_traffic = true;
-      }
-      return std::nullopt;
-    }
-    // A real success -- matches the doc comment's contract of leaving
-    // blocked_by_traffic false (not just unset) whenever plan() succeeds,
-    // even if an earlier duration/radius attempt had set it true.
-    if (blocked_by_traffic) {
-      *blocked_by_traffic = false;
-    }
-    return candidate;
-  };
-
   const auto tryDurations = [&](
                               const PathShape & shape, const std::string & shape_label,
-                              std::string * out_reason,
-                              double * out_duration) -> std::optional<Trajectory> {
+                              std::string * out_reason) -> std::optional<Trajectory> {
     for (double duration = initial_guess; duration <= params_.max_duration;
          duration += params_.duration_step) {
-      if (auto candidate = tryOneCandidate(shape, duration, shape_label, out_reason);
-          candidate.has_value()) {
-        if (out_duration) {
-          *out_duration = duration;
-        }
-        return candidate;
+      auto candidate = buildCandidate(start, shape, goal_pose, duration, stamp);
+      if (!candidate.has_value()) {
+        continue;
       }
+      std::string reason;
+      if (!satisfiesKinematicConstraints(*candidate, &reason)) {
+        if (out_reason) {
+          std::ostringstream oss;
+          oss << shape_label << " duration=" << duration << "s: " << reason << " [start=("
+              << start.pose.position.x << "," << start.pose.position.y << "," << start_yaw
+              << "rad,v=" << start.speed << ") goal=(" << goal_pose.position.x << ","
+              << goal_pose.position.y << "," << goal_yaw << "rad) heading_delta=" << heading_delta
+              << "rad distance=" << distance << "m]";
+          *out_reason = oss.str();
+        }
+        continue;
+      }
+      if (!isCollisionFree(*candidate, objects, stamp, &reason)) {
+        if (out_reason) {
+          std::ostringstream oss;
+          oss << shape_label << " duration=" << duration << "s: " << reason;
+          *out_reason = oss.str();
+        }
+        if (blocked_by_traffic) {
+          *blocked_by_traffic = true;
+        }
+        continue;
+      }
+      // A real success -- matches the doc comment's contract of leaving
+      // blocked_by_traffic false (not just unset) whenever plan() succeeds,
+      // even if an earlier duration/radius attempt had set it true.
+      if (blocked_by_traffic) {
+        *blocked_by_traffic = false;
+      }
+      return candidate;
     }
     return std::nullopt;
   };
-
-  // Attempt 0 (fast path, only if the caller passed one): retry *exactly*
-  // last cycle's successful shape+duration before searching for anything
-  // new -- see ShapeHint's docs for why this matters (reference-trajectory
-  // stability across the receding-horizon replanning cycle, not just goal
-  // stability). Deliberately a single tryOneCandidate call, not a sweep --
-  // if this exact combination no longer works, fall through to the normal
-  // fresh search below rather than searching *around* it.
-  if (preferred_hint) {
-    const CurvatureSpiralPath preferred_spiral(start.pose, goal_pose, params_.max_curvature);
-    const DubinsPath preferred_dubins(start.pose, goal_pose, preferred_hint->turn_radius);
-    const bool preferred_shape_valid =
-      preferred_hint->use_spiral ? preferred_spiral.valid() : preferred_dubins.valid();
-    if (preferred_shape_valid) {
-      const PathShape & preferred_shape =
-        preferred_hint->use_spiral ? static_cast<const PathShape &>(preferred_spiral)
-                                    : static_cast<const PathShape &>(preferred_dubins);
-      if (auto candidate = tryOneCandidate(
-            preferred_shape, preferred_hint->duration, "preferred (repeated)", nullptr);
-          candidate.has_value()) {
-        if (used_hint) {
-          *used_hint = *preferred_hint;
-        }
-        return candidate;
-      }
-    }
-  }
 
   // Attempt 1 (preferred): variable-curvature spiral. A single shape, no
   // radius-style search needed -- see CurvatureSpiralPath's class docs for
@@ -549,13 +505,9 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const CurvatureSpiralPath spiral(
     start.pose, goal_pose, params_.max_curvature, &spiral_shape_diagnostic);
   std::string spiral_duration_reason;  // Only set if the shape was valid but no duration worked.
-  double spiral_duration = 0.0;
   if (spiral.valid()) {
-    if (auto candidate = tryDurations(spiral, "spiral", &spiral_duration_reason, &spiral_duration);
+    if (auto candidate = tryDurations(spiral, "spiral", &spiral_duration_reason);
         candidate.has_value()) {
-      if (used_hint) {
-        *used_hint = ShapeHint{true, 0.0, spiral_duration};
-      }
       return candidate;
     }
   }
@@ -573,12 +525,8 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
     }
     std::ostringstream label;
     label << "dubins radius=" << turn_radius << "m";
-    double dubins_duration = 0.0;
-    if (auto candidate = tryDurations(path, label.str(), &dubins_reason, &dubins_duration);
+    if (auto candidate = tryDurations(path, label.str(), &dubins_reason);
         candidate.has_value()) {
-      if (used_hint) {
-        *used_hint = ShapeHint{false, turn_radius, dubins_duration};
-      }
       return candidate;
     }
   }

@@ -344,13 +344,10 @@ void PullOverManagerNode::onOperateMrm(
     RCLCPP_INFO(get_logger(), "OperateMrm(operate=false) received -- standing down.");
     state_ = ManagerState::kIdle;
     active_goal_.reset();
-    active_goal_shape_hint_.reset();
     deceleration_goal_.reset();
-    deceleration_goal_shape_hint_.reset();
     last_trajectory_.reset();
     zero_speed_since_.reset();
     contingency_stop_goal_.reset();
-    contingency_stop_goal_shape_hint_.reset();
     consecutive_traffic_blocked_cycles_ = 0;
     restoreControllerStopDistOverride();
     response->response.success = true;
@@ -602,7 +599,6 @@ void PullOverManagerNode::onPlanningTimer()
           goal->maneuver_initial_jerk);
         active_goal_ = goal->pose;
         deceleration_goal_.reset();
-        deceleration_goal_shape_hint_.reset();
         consecutive_planning_failures_ = 0;
         state_ = ManagerState::kOperating;
         return;  // Let the next cycle (100ms away) build the real pull-over trajectory.
@@ -617,7 +613,6 @@ void PullOverManagerNode::onPlanningTimer()
         ego_speed);
       state_ = ManagerState::kFailed;
       deceleration_goal_.reset();
-      deceleration_goal_shape_hint_.reset();
       restoreControllerStopDistOverride();
       return;
     }
@@ -638,10 +633,8 @@ void PullOverManagerNode::onPlanningTimer()
     start.accel = seedAccelerationFromLastTrajectory(plan_stamp);
 
     std::string failure_reason;
-    PullOverTrajectoryPlanner::ShapeHint used_hint;
     const auto trajectory = trajectory_planner_->plan(
-      start, *deceleration_goal_, latest_objects_, plan_stamp, &failure_reason, nullptr,
-      deceleration_goal_shape_hint_ ? &*deceleration_goal_shape_hint_ : nullptr, &used_hint);
+      start, *deceleration_goal_, latest_objects_, plan_stamp, &failure_reason);
     if (!trajectory.has_value()) {
       RCLCPP_WARN(
         get_logger(), "No feasible in-lane braking trajectory found this cycle. Last reason: %s",
@@ -650,7 +643,6 @@ void PullOverManagerNode::onPlanningTimer()
                // this straight-line case is not expected to fail the way a curved
                // pull-over approach can.
     }
-    deceleration_goal_shape_hint_ = used_hint;
     publishTrajectory(*trajectory);
     return;
   }
@@ -669,7 +661,6 @@ void PullOverManagerNode::onPlanningTimer()
       distance_to_goal, ego_speed);
     state_ = ManagerState::kSucceeded;
     active_goal_.reset();
-    active_goal_shape_hint_.reset();
     restoreControllerStopDistOverride();
     requestOperationModeStop();
     return;
@@ -683,17 +674,13 @@ void PullOverManagerNode::onPlanningTimer()
 
   std::string failure_reason;
   bool blocked_by_traffic = false;
-  PullOverTrajectoryPlanner::ShapeHint used_hint;
   const auto trajectory = trajectory_planner_->plan(
-    start, *active_goal_, latest_objects_, plan_stamp, &failure_reason, &blocked_by_traffic,
-    active_goal_shape_hint_ ? &*active_goal_shape_hint_ : nullptr, &used_hint);
+    start, *active_goal_, latest_objects_, plan_stamp, &failure_reason, &blocked_by_traffic);
 
   if (trajectory.has_value()) {
-    active_goal_shape_hint_ = used_hint;
     consecutive_planning_failures_ = 0;
     consecutive_traffic_blocked_cycles_ = 0;
     contingency_stop_goal_.reset();
-    contingency_stop_goal_shape_hint_.reset();
     publishTrajectory(*trajectory);
     return;
   }
@@ -717,13 +704,9 @@ void PullOverManagerNode::onPlanningTimer()
         failure_reason.c_str());
     }
     std::string contingency_reason;
-    PullOverTrajectoryPlanner::ShapeHint contingency_used_hint;
     const auto contingency_trajectory = trajectory_planner_->plan(
-      start, *contingency_stop_goal_, latest_objects_, plan_stamp, &contingency_reason, nullptr,
-      contingency_stop_goal_shape_hint_ ? &*contingency_stop_goal_shape_hint_ : nullptr,
-      &contingency_used_hint);
+      start, *contingency_stop_goal_, latest_objects_, plan_stamp, &contingency_reason);
     if (contingency_trajectory.has_value()) {
-      contingency_stop_goal_shape_hint_ = contingency_used_hint;
       publishTrajectory(*contingency_trajectory);
     } else {
       // Rare (the contingency goal is a trivial straight-line brake) -- e.g.
@@ -740,9 +723,7 @@ void PullOverManagerNode::onPlanningTimer()
         consecutive_traffic_blocked_cycles_);
       state_ = ManagerState::kFailed;
       active_goal_.reset();
-      active_goal_shape_hint_.reset();
       contingency_stop_goal_.reset();
-      contingency_stop_goal_shape_hint_.reset();
       restoreControllerStopDistOverride();
     }
     return;
@@ -761,7 +742,6 @@ void PullOverManagerNode::onPlanningTimer()
       consecutive_planning_failures_);
     state_ = ManagerState::kFailed;
     active_goal_.reset();
-    active_goal_shape_hint_.reset();
     restoreControllerStopDistOverride();
   }
 }
@@ -843,10 +823,7 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
   // trajectory (see seedAccelerationFromLastTrajectory()).
   last_trajectory_.reset();
   zero_speed_since_.reset();
-  active_goal_shape_hint_.reset();
-  deceleration_goal_shape_hint_.reset();
   contingency_stop_goal_.reset();
-  contingency_stop_goal_shape_hint_.reset();
   consecutive_traffic_blocked_cycles_ = 0;
 
   if (require_autonomous_mode_ && !autonomous_mode_engaged_) {

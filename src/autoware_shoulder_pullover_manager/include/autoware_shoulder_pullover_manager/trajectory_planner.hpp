@@ -226,30 +226,6 @@ struct TrajectoryPlannerParams
 class PullOverTrajectoryPlanner
 {
 public:
-  /// Identifies exactly which shape+parameters a successful plan() call
-  /// used, so the caller (PullOverManagerNode) can ask for the *same* one
-  /// again next cycle -- see plan()'s `preferred_hint`/`used_hint` docs for
-  /// why this exists: added 2026-08-12 after live testing found the real
-  /// driven path visibly diverging from the visualized planned path. Root
-  /// cause: this is a receding-horizon planner that rebuilds the entire
-  /// trajectory from scratch every ~100ms, and `initial_guess` (the
-  /// duration search's own starting point) shifts every single cycle as
-  /// distance-to-goal and speed change -- so "first feasible candidate"
-  /// could land on a different duration, or even a different shape/radius
-  /// entirely, cycle to cycle near any feasibility boundary, even though
-  /// the goal itself never moved. The real vehicle was never actually
-  /// tracking one smooth curve; it was following a patchwork of many
-  /// different short-lived plans. This also plausibly explains why MPC's
-  /// own steer-convergence check never settled (see project memory) -- it
-  /// was being fed a constantly-shifting reference, not a fixed target to
-  /// converge to.
-  struct ShapeHint
-  {
-    bool use_spiral{true};    ///< true: CurvatureSpiralPath; false: DubinsPath with turn_radius.
-    double turn_radius{0.0};  ///< Only meaningful when !use_spiral.
-    double duration{0.0};
-  };
-
   explicit PullOverTrajectoryPlanner(const TrajectoryPlannerParams & params);
 
   /// Returns a feasible trajectory from `start` to `goal_pose`, or
@@ -277,26 +253,10 @@ public:
   /// actively contingency-brake and keep retrying indefinitely; the second
   /// should count toward giving up). Left false (not merely unset) when the
   /// function succeeds, so callers can check it unconditionally.
-  ///
-  /// If `preferred_hint` is non-null, that *exact* shape+duration is tried
-  /// FIRST, as a single candidate, before falling back to the normal fresh
-  /// search below -- see ShapeHint's docs for why (cycle-to-cycle stability
-  /// of the reference trajectory, not just of the goal). If it's still
-  /// feasible and collision-free, it wins immediately, keeping the plan
-  /// identical to last cycle's. Only if it's no longer feasible does this
-  /// fall through to the full search, which behaves exactly as it did
-  /// before this parameter existed.
-  ///
-  /// If `used_hint` is non-null, it is set to whichever shape+duration the
-  /// returned trajectory actually used (whether that came from
-  /// `preferred_hint` succeeding again or a fresh search finding something
-  /// new) -- callers should feed this back in as next cycle's
-  /// `preferred_hint`. Left unmodified if plan() returns std::nullopt.
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> plan(
     const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
     const autoware_perception_msgs::msg::PredictedObjects & objects, const rclcpp::Time & stamp,
-    std::string * failure_reason = nullptr, bool * blocked_by_traffic = nullptr,
-    const ShapeHint * preferred_hint = nullptr, ShapeHint * used_hint = nullptr) const;
+    std::string * failure_reason = nullptr, bool * blocked_by_traffic = nullptr) const;
 
 private:
   /// Coefficients of a scalar quintic q(t) = c0 + c1 t + c2 t^2 + c3 t^3 +
