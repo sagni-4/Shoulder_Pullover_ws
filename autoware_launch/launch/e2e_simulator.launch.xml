@@ -8,6 +8,7 @@
   <arg name="data_path" default="$(env HOME)/autoware_data/ml_models" description="packages data and artifacts directory path"/>
   <arg name="simulator_type" default="awsim" description="select the simulator type ('awsim' or 'carla')"/>
   <arg name="launch_simulator_interface" default="true" description="launch simulator interface (e.g. autoware_carla_interface when simulator_type is 'carla')"/>
+  <arg name="spawn_point" default="None" description="CARLA-only: fixed ego spawn transform 'x,y,z,roll,pitch,yaw' (degrees, CARLA world frame), or 'None' for a random valid spawn point"/>
 
   <!-- launch module preset -->
   <arg name="planning_module_preset" default="default" description="planning module preset"/>
@@ -46,7 +47,10 @@
     <!-- AWSIM does not require a simulator interface since it publishes autoware_msgs directly -->
     <!-- CARLA -->
     <group scoped="false" if="$(equals $(var simulator_type) 'carla')">
-      <include file="$(find-pkg-share autoware_carla_interface)/launch/autoware_carla_interface.launch.xml"/>
+      <include file="$(find-pkg-share autoware_carla_interface)/launch/autoware_carla_interface.launch.xml">
+        <arg name="map_path" value="$(var map_path)"/>
+        <arg name="spawn_point" value="$(var spawn_point)"/>
+      </include>
     </group>
   </group>
 
