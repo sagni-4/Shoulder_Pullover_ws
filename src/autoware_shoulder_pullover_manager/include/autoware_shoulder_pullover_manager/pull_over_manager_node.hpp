@@ -304,6 +304,17 @@ private:
 
   ManagerState state_{ManagerState::kIdle};
   std::optional<geometry_msgs::msg::Pose> active_goal_;
+  /// Which shape+duration successfully planned toward active_goal_ last
+  /// cycle, fed back in as PullOverTrajectoryPlanner::plan()'s
+  /// preferred_hint next cycle -- see ShapeHint's docs (trajectory_planner.hpp)
+  /// for why this matters: without it, a receding-horizon replan from
+  /// scratch every ~100ms could land on a different duration/shape/radius
+  /// near any feasibility boundary even though the goal never moved, so the
+  /// real driven path was a patchwork of many different short-lived plans
+  /// instead of one stable curve -- live-observed 2026-08-12 as the real
+  /// path visibly diverging from the visualized planned path. Reset
+  /// whenever active_goal_ itself resets.
+  std::optional<PullOverTrajectoryPlanner::ShapeHint> active_goal_shape_hint_;
   /// Fixed once, the instant kDecelerating begins -- **not** resynthesized
   /// from ego's current pose every cycle. Live-tested finding (2026-08-05):
   /// a receding-horizon quintic that resets v0 to ego's *current* actual
@@ -319,6 +330,9 @@ private:
   /// cycle as ego approaches it, so urgency (and therefore commanded
   /// deceleration) actually increases over time instead of resetting.
   std::optional<geometry_msgs::msg::Pose> deceleration_goal_;
+  /// Same purpose as active_goal_shape_hint_, for deceleration_goal_'s own
+  /// plan() calls. Reset whenever deceleration_goal_ itself resets.
+  std::optional<PullOverTrajectoryPlanner::ShapeHint> deceleration_goal_shape_hint_;
   /// Fixed the instant kOperating's plan() first reports blocked_by_traffic
   /// (see that flag's docs in trajectory_planner.hpp), the same way
   /// deceleration_goal_ is fixed for kDecelerating and for the identical
@@ -329,6 +343,9 @@ private:
   /// caused before that fix. Cleared the instant the real active_goal_ plan
   /// succeeds again (traffic cleared) or the maneuver ends.
   std::optional<geometry_msgs::msg::Pose> contingency_stop_goal_;
+  /// Same purpose as active_goal_shape_hint_, for contingency_stop_goal_'s
+  /// own plan() calls. Reset whenever contingency_stop_goal_ itself resets.
+  std::optional<PullOverTrajectoryPlanner::ShapeHint> contingency_stop_goal_shape_hint_;
   int consecutive_planning_failures_{0};
   /// Cycles the *real* pull-over maneuver has spent blocked by traffic
   /// (contingency-braking instead of progressing toward active_goal_) --
