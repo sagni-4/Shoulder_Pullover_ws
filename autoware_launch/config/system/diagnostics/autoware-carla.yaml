@@ -46,14 +46,25 @@ units:
       - { type: link, link: /autoware/system }
       - { type: link, link: /adapi/mrm_request/delegate }
 
+  # Deliberately NARROWER than /autoware/modes/autonomous above: this project's
+  # standalone pull-over planner (autoware_shoulder_pullover_manager) does not
+  # depend on the full autonomous-driving stack being healthy -- only on ego
+  # pose (localization), the map, and a working vehicle/system layer. Keeping
+  # this identical to /autoware/modes/autonomous (as it was before) made
+  # pull_over structurally unreachable via real MRM escalation: since MRM only
+  # triggers when autonomous availability drops, and pull_over shared every
+  # one of its dependencies, pull_over always became unavailable at the exact
+  # same moment, so mrm_handler's own pull_over branch in getCurrentMrmBehavior()
+  # could never actually fire, falling through to emergency_stop every time.
+  # Dropping planning/perception/control here (matching the same reasoning
+  # emergency_stop's own much narrower dependency list already uses) lets a
+  # degradation there select pull_over instead -- the actual point of having
+  # a distinct fallback behavior in the first place.
   - path: /autoware/modes/pull_over
     type: and
     list:
       - { type: link, link: /autoware/map }
       - { type: link, link: /autoware/localization }
-      - { type: link, link: /autoware/planning }
-      - { type: link, link: /autoware/perception }
-      - { type: link, link: /autoware/control }
       - { type: link, link: /autoware/vehicle }
       - { type: link, link: /autoware/system }
       - { type: link, link: /adapi/mrm_request/delegate }
