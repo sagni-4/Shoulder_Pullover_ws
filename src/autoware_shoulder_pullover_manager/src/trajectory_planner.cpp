@@ -420,8 +420,12 @@ bool PullOverTrajectoryPlanner::isCollisionFree(
 
 std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
-  const PredictedObjects & objects, const rclcpp::Time & stamp, std::string * failure_reason) const
+  const PredictedObjects & objects, const rclcpp::Time & stamp, std::string * failure_reason,
+  bool * blocked_by_traffic) const
 {
+  if (blocked_by_traffic) {
+    *blocked_by_traffic = false;
+  }
   const double distance = std::hypot(
     goal_pose.position.x - start.pose.position.x, goal_pose.position.y - start.pose.position.y);
   const double average_speed_estimate = std::max(start.speed, 1.0) / 1.5;
@@ -477,7 +481,16 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
           oss << shape_label << " duration=" << duration << "s: " << reason;
           *out_reason = oss.str();
         }
+        if (blocked_by_traffic) {
+          *blocked_by_traffic = true;
+        }
         continue;
+      }
+      // A real success -- matches the doc comment's contract of leaving
+      // blocked_by_traffic false (not just unset) whenever plan() succeeds,
+      // even if an earlier duration/radius attempt had set it true.
+      if (blocked_by_traffic) {
+        *blocked_by_traffic = false;
       }
       return candidate;
     }

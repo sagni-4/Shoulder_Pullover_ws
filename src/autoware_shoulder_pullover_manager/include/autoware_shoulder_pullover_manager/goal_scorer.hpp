@@ -151,6 +151,21 @@ struct GoalScorerParams
   /// candidate before ever attempting it, not meant to replace that
   /// check.
   double max_maneuver_jerk{3.0};
+
+  /// How far (meters, each direction along the centerline) to look when
+  /// computing the candidate goal's *heading* via a length-weighted average
+  /// of local tangent segments, instead of trusting that single waypoint's
+  /// own orientation field directly. Added 2026-08-12: shoulder_centerline_node
+  /// publishes per-point headings derived from live PointPainting fusion +
+  /// spline fitting, which carries real point-to-point jitter -- using one
+  /// noisy sample directly as the trajectory's terminal heading produced a
+  /// final parked pose visibly skewed from parallel-to-shoulder, not a
+  /// planner bug but a goal-definition one. Averaging tangent segments
+  /// across a short window (bounded by max_continuity_gap_ same as
+  /// continuityRunLength, so it never reaches across a real discontinuity)
+  /// gives a heading that reflects the shoulder's actual local direction
+  /// instead of one sample's noise.
+  double heading_smoothing_distance{3.0};
 };
 
 /// A single scored candidate shoulder-goal, with the raw measurements kept
@@ -203,6 +218,16 @@ private:
   /// max_continuity_gap_.
   [[nodiscard]] double continuityRunLength(const nav_msgs::msg::Path & path, std::size_t index)
     const;
+
+  /// Length-weighted average tangent direction of the centerline segments
+  /// within heading_smoothing_distance_ of `index` in either direction
+  /// (stopping early at a gap larger than max_continuity_gap_, same rule
+  /// continuityRunLength uses) -- see heading_smoothing_distance's docs for
+  /// why this replaces trusting that one waypoint's own orientation field.
+  /// Falls back to that raw field only if no usable neighbor segment exists
+  /// (e.g. `index` is the path's only point).
+  [[nodiscard]] geometry_msgs::msg::Quaternion smoothedHeading(
+    const nav_msgs::msg::Path & path, std::size_t index) const;
 
   GoalScorerParams params_;
 };

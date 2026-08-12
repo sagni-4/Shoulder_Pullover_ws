@@ -241,10 +241,22 @@ public:
   /// rejected (e.g. which constraint, by how much, or which object it
   /// would have collided with) -- callers should log this rather than
   /// guess at the cause.
+  ///
+  /// If `blocked_by_traffic` is non-null, it is set to true iff at least one
+  /// tried candidate satisfied every kinematic constraint and was rejected
+  /// *only* by the collision check -- i.e. the maneuver's geometry is fine,
+  /// something is just currently in the way. Added 2026-08-12: this is the
+  /// signal PullOverManagerNode uses to distinguish "temporarily blocked by
+  /// traffic, brake and wait for it to clear" from "no valid shape exists
+  /// for this goal at all" -- those two failure modes look identical from
+  /// nullopt alone but call for very different responses (the first should
+  /// actively contingency-brake and keep retrying indefinitely; the second
+  /// should count toward giving up). Left false (not merely unset) when the
+  /// function succeeds, so callers can check it unconditionally.
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> plan(
     const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
     const autoware_perception_msgs::msg::PredictedObjects & objects, const rclcpp::Time & stamp,
-    std::string * failure_reason = nullptr) const;
+    std::string * failure_reason = nullptr, bool * blocked_by_traffic = nullptr) const;
 
 private:
   /// Coefficients of a scalar quintic q(t) = c0 + c1 t + c2 t^2 + c3 t^3 +

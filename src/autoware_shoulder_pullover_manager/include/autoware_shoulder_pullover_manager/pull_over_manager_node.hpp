@@ -8,6 +8,7 @@
 #include <rclcpp/parameter_client.hpp>
 
 #include <autoware_adapi_v1_msgs/msg/operation_mode_state.hpp>
+#include <autoware_adapi_v1_msgs/srv/change_operation_mode.hpp>
 #include <autoware_perception_msgs/msg/predicted_objects.hpp>
 #include <autoware_planning_msgs/msg/trajectory.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -201,6 +202,19 @@ private:
   /// reactive rather than proactive.
   void checkControllerStuckAndOverride(double ego_speed, const rclcpp::Time & now);
 
+  /// Called once, the instant a maneuver reaches kSucceeded. mrm_handler's
+  /// own MRM_OPERATING->MRM_SUCCEEDED transition for the PULL_OVER behavior
+  /// (see autoware_mrm_handler's updateMrmState()) requires
+  /// isArrivedAtGoal(), which checks `/api/operation_mode/state == STOP` --
+  /// not this node's own arrival check, and not anything this node used to
+  /// touch. Since our maneuver isn't set via the normal routing/route-
+  /// completion path, nothing ever transitioned operation mode to STOP on
+  /// its own, so mrm_handler's MRM state stayed latched at OPERATING forever
+  /// even once the vehicle had genuinely stopped at the goal -- live-observed
+  /// 2026-08-12, RViz's MRM State/Behavior panel showed "Operating" /
+  /// "Pull Over" indefinitely. Requesting STOP here closes that loop.
+  void requestOperationModeStop();
+
   /// Shared by both kDecelerating and kOperating -- publishes `trajectory`
   /// on every configured output (debug trajectory/path/marker, and
   /// direct_trajectory_output_topic_ if set).
@@ -252,6 +266,7 @@ private:
   double arrival_distance_threshold_{1.0};
   double arrival_speed_threshold_{0.2};
   int max_consecutive_planning_failures_{30};
+  int max_consecutive_traffic_blocked_cycles_{300};  ///< See consecutive_traffic_blocked_cycles_.
   double deceleration_lookahead_distance_{40.0};  ///< m. How far ahead (along ego's current
                                                    ///< heading) the synthetic straight-line
                                                    ///< braking goal is placed each cycle.
@@ -304,7 +319,25 @@ private:
   /// cycle as ego approaches it, so urgency (and therefore commanded
   /// deceleration) actually increases over time instead of resetting.
   std::optional<geometry_msgs::msg::Pose> deceleration_goal_;
+  /// Fixed the instant kOperating's plan() first reports blocked_by_traffic
+  /// (see that flag's docs in trajectory_planner.hpp), the same way
+  /// deceleration_goal_ is fixed for kDecelerating and for the identical
+  /// reason: resynthesizing a "brake from here" goal fresh from ego's
+  /// current pose every cycle would mean v0 always equals ego's *current*
+  /// speed, so the commanded near-term speed never visibly drops -- see
+  /// deceleration_goal_'s own docs for the live-verified failure mode this
+  /// caused before that fix. Cleared the instant the real active_goal_ plan
+  /// succeeds again (traffic cleared) or the maneuver ends.
+  std::optional<geometry_msgs::msg::Pose> contingency_stop_goal_;
   int consecutive_planning_failures_{0};
+  /// Cycles the *real* pull-over maneuver has spent blocked by traffic
+  /// (contingency-braking instead of progressing toward active_goal_) --
+  /// separate from consecutive_planning_failures_ so genuinely waiting for
+  /// another vehicle/pedestrian to clear the path (which can reasonably
+  /// take much longer than a few seconds) doesn't trigger the same tight
+  /// give-up threshold meant for "no valid maneuver shape exists at all."
+  /// Reset to 0 the instant active_goal_'s own plan succeeds again.
+  int consecutive_traffic_blocked_cycles_{0};
   /// The most recently *published* trajectory (kDecelerating or kOperating,
   /// whichever was active), kept only to seed the next planning cycle's
   /// start-acceleration boundary condition -- see
@@ -332,6 +365,8 @@ private:
   /// checkControllerStuckAndOverride().
   std::optional<rclcpp::Time> zero_speed_since_;
   rclcpp::AsyncParametersClient::SharedPtr controller_param_client_;
+  rclcpp::Client<autoware_adapi_v1_msgs::srv::ChangeOperationMode>::SharedPtr
+    change_to_stop_client_;
 
   // --- ROS interfaces ---------------------------------------------------
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr centerline_sub_;

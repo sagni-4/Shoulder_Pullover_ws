@@ -27,6 +27,17 @@ double yawFromQuaternion(const geometry_msgs::msg::Quaternion & q)
   const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
   return std::atan2(siny_cosp, cosy_cosp);
 }
+
+/// Inverse of yawFromQuaternion -- a planar (roll=pitch=0) orientation.
+geometry_msgs::msg::Quaternion quaternionFromYaw(double yaw)
+{
+  geometry_msgs::msg::Quaternion q;
+  q.x = 0.0;
+  q.y = 0.0;
+  q.z = std::sin(yaw / 2.0);
+  q.w = std::cos(yaw / 2.0);
+  return q;
+}
 }  // namespace
 
 GoalScorer::GoalScorer(const GoalScorerParams & params) : params_(params) {}
@@ -69,6 +80,53 @@ double GoalScorer::continuityRunLength(const nav_msgs::msg::Path & path, std::si
     run_length += gap;
   }
   return run_length;
+}
+
+geometry_msgs::msg::Quaternion GoalScorer::smoothedHeading(
+  const nav_msgs::msg::Path & path, std::size_t index) const
+{
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+
+  // Backward half of the window.
+  double back_span = 0.0;
+  for (std::size_t i = index; i > 0; --i) {
+    const auto & p1 = path.poses[i].pose.position;
+    const auto & p0 = path.poses[i - 1].pose.position;
+    const double seg_x = p1.x - p0.x;
+    const double seg_y = p1.y - p0.y;
+    const double seg_len = std::hypot(seg_x, seg_y);
+    if (seg_len > params_.max_continuity_gap || back_span + seg_len > params_.heading_smoothing_distance) {
+      break;
+    }
+    sum_x += seg_x;
+    sum_y += seg_y;
+    back_span += seg_len;
+  }
+
+  // Forward half of the window.
+  double forward_span = 0.0;
+  for (std::size_t i = index; i + 1 < path.poses.size(); ++i) {
+    const auto & p0 = path.poses[i].pose.position;
+    const auto & p1 = path.poses[i + 1].pose.position;
+    const double seg_x = p1.x - p0.x;
+    const double seg_y = p1.y - p0.y;
+    const double seg_len = std::hypot(seg_x, seg_y);
+    if (seg_len > params_.max_continuity_gap ||
+        forward_span + seg_len > params_.heading_smoothing_distance) {
+      break;
+    }
+    sum_x += seg_x;
+    sum_y += seg_y;
+    forward_span += seg_len;
+  }
+
+  if (std::hypot(sum_x, sum_y) < 1e-6) {
+    // No usable neighbor segment (isolated point) -- fall back to the raw
+    // per-point orientation rather than an undefined atan2(0, 0).
+    return path.poses[index].pose.orientation;
+  }
+  return quaternionFromYaw(std::atan2(sum_y, sum_x));
 }
 
 std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
@@ -158,6 +216,10 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
     if (!best.has_value() || score > best->score) {
       ScoredCandidate candidate;
       candidate.pose = centerline_map.poses[i].pose;
+      // Replace the raw per-point heading with a locally-smoothed tangent --
+      // see smoothedHeading()'s docs. Position stays exactly the raw
+      // waypoint's; only orientation changes.
+      candidate.pose.orientation = smoothedHeading(centerline_map, i);
       candidate.score = score;
       candidate.distance_from_ego = distance;
       candidate.curvature = curvature;

@@ -80,6 +80,8 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     declare_parameter<double>("max_maneuver_curvature", scorer_params_.max_maneuver_curvature);
   scorer_params_.max_maneuver_jerk =
     declare_parameter<double>("max_maneuver_jerk", scorer_params_.max_maneuver_jerk);
+  scorer_params_.heading_smoothing_distance = declare_parameter<double>(
+    "heading_smoothing_distance", scorer_params_.heading_smoothing_distance);
 
   // --- Parameters: trajectory planning --------------------------------------
   trajectory_params_.dt = declare_parameter<double>("trajectory_dt", trajectory_params_.dt);
@@ -125,6 +127,8 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   arrival_speed_threshold_ = declare_parameter<double>("arrival_speed_threshold", 0.2);
   max_consecutive_planning_failures_ =
     declare_parameter<int>("max_consecutive_planning_failures", 30);
+  max_consecutive_traffic_blocked_cycles_ =
+    declare_parameter<int>("max_consecutive_traffic_blocked_cycles", 300);
   deceleration_lookahead_distance_ = declare_parameter<double>(
     "deceleration_lookahead_distance", deceleration_lookahead_distance_);
   deceleration_giveup_speed_threshold_ = declare_parameter<double>(
@@ -263,6 +267,9 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
       onOperateMrm(request, response);
     });
 
+  change_to_stop_client_ = create_client<autoware_adapi_v1_msgs::srv::ChangeOperationMode>(
+    "/api/operation_mode/change_to_stop");
+
   status_pub_ = create_publisher<MrmBehaviorStatus>(kStatusTopicName, rclcpp::QoS(1));
   trajectory_debug_pub_ =
     create_publisher<Trajectory>("~/planned_trajectory", rclcpp::QoS(1));
@@ -340,6 +347,8 @@ void PullOverManagerNode::onOperateMrm(
     deceleration_goal_.reset();
     last_trajectory_.reset();
     zero_speed_since_.reset();
+    contingency_stop_goal_.reset();
+    consecutive_traffic_blocked_cycles_ = 0;
     restoreControllerStopDistOverride();
     response->response.success = true;
     response->response.message = "stood down";
@@ -511,6 +520,29 @@ void PullOverManagerNode::restoreControllerStopDistOverride()
     original_drive_state_stop_dist_, controller_node_name_.c_str());
 }
 
+void PullOverManagerNode::requestOperationModeStop()
+{
+  if (!change_to_stop_client_->service_is_ready()) {
+    RCLCPP_WARN(
+      get_logger(),
+      "/api/operation_mode/change_to_stop not available -- mrm_handler's own MRM state will "
+      "stay latched at OPERATING even though the maneuver succeeded (it waits for operation "
+      "mode to reach STOP, see requestOperationModeStop()'s docs).");
+    return;
+  }
+  auto request = std::make_shared<autoware_adapi_v1_msgs::srv::ChangeOperationMode::Request>();
+  change_to_stop_client_->async_send_request(
+    request,
+    [this](rclcpp::Client<autoware_adapi_v1_msgs::srv::ChangeOperationMode>::SharedFuture future) {
+      const auto response = future.get();
+      if (!response->status.success) {
+        RCLCPP_WARN(
+          get_logger(), "change_to_stop after arrival failed: %s",
+          response->status.message.c_str());
+      }
+    });
+}
+
 void PullOverManagerNode::checkControllerStuckAndOverride(
   double ego_speed, const rclcpp::Time & now)
 {
@@ -630,6 +662,7 @@ void PullOverManagerNode::onPlanningTimer()
     state_ = ManagerState::kSucceeded;
     active_goal_.reset();
     restoreControllerStopDistOverride();
+    requestOperationModeStop();
     return;
   }
 
@@ -640,30 +673,77 @@ void PullOverManagerNode::onPlanningTimer()
   start.accel = seedAccelerationFromLastTrajectory(plan_stamp);
 
   std::string failure_reason;
-  const auto trajectory =
-    trajectory_planner_->plan(start, *active_goal_, latest_objects_, plan_stamp, &failure_reason);
+  bool blocked_by_traffic = false;
+  const auto trajectory = trajectory_planner_->plan(
+    start, *active_goal_, latest_objects_, plan_stamp, &failure_reason, &blocked_by_traffic);
 
-  if (!trajectory.has_value()) {
-    ++consecutive_planning_failures_;
-    RCLCPP_WARN(
-      get_logger(),
-      "No feasible/collision-free trajectory found this cycle (%d/%d consecutive). Last reason: %s",
-      consecutive_planning_failures_, max_consecutive_planning_failures_, failure_reason.c_str());
-    if (consecutive_planning_failures_ >= max_consecutive_planning_failures_) {
-      RCLCPP_ERROR(
+  if (trajectory.has_value()) {
+    consecutive_planning_failures_ = 0;
+    consecutive_traffic_blocked_cycles_ = 0;
+    contingency_stop_goal_.reset();
+    publishTrajectory(*trajectory);
+    return;
+  }
+
+  if (blocked_by_traffic) {
+    // The real maneuver's shape/timing is fine -- something is just
+    // currently in the way. Contingency-brake toward a fixed point ahead
+    // (same buildDecelerationGoal()/fix-once pattern kDecelerating uses,
+    // see contingency_stop_goal_'s docs for why resynthesizing it fresh
+    // every cycle would silently defeat real deceleration) rather than
+    // either blindly continuing the last stale goal-directed trajectory or
+    // publishing nothing until the tight max_consecutive_planning_failures_
+    // threshold gives up on what is not actually an infeasible goal.
+    ++consecutive_traffic_blocked_cycles_;
+    if (!contingency_stop_goal_.has_value()) {
+      contingency_stop_goal_ = buildDecelerationGoal(ego_pose);
+      RCLCPP_WARN(
         get_logger(),
-        "Giving up: no feasible trajectory for %d consecutive cycles -- likely blocked by an "
-        "obstacle or an infeasible goal.",
-        consecutive_planning_failures_);
+        "Pull-over path blocked by traffic (%s) -- contingency-braking in place until it "
+        "clears.",
+        failure_reason.c_str());
+    }
+    std::string contingency_reason;
+    const auto contingency_trajectory = trajectory_planner_->plan(
+      start, *contingency_stop_goal_, latest_objects_, plan_stamp, &contingency_reason);
+    if (contingency_trajectory.has_value()) {
+      publishTrajectory(*contingency_trajectory);
+    } else {
+      // Rare (the contingency goal is a trivial straight-line brake) -- e.g.
+      // the blocking object is now directly ahead on that line too. Publish
+      // nothing this cycle; the gate holds the last trajectory (which was
+      // itself already collision-checked when generated) until next cycle.
+      RCLCPP_WARN(
+        get_logger(), "Contingency brake trajectory also infeasible this cycle. Last reason: %s",
+        contingency_reason.c_str());
+    }
+    if (consecutive_traffic_blocked_cycles_ >= max_consecutive_traffic_blocked_cycles_) {
+      RCLCPP_ERROR(
+        get_logger(), "Giving up: pull-over path has been blocked by traffic for %d consecutive cycles.",
+        consecutive_traffic_blocked_cycles_);
       state_ = ManagerState::kFailed;
       active_goal_.reset();
+      contingency_stop_goal_.reset();
       restoreControllerStopDistOverride();
     }
     return;
   }
 
-  consecutive_planning_failures_ = 0;
-  publishTrajectory(*trajectory);
+  // Not traffic -- a genuine kinematic/shape infeasibility for this goal.
+  ++consecutive_planning_failures_;
+  RCLCPP_WARN(
+    get_logger(),
+    "No feasible trajectory found this cycle (%d/%d consecutive). Last reason: %s",
+    consecutive_planning_failures_, max_consecutive_planning_failures_, failure_reason.c_str());
+  if (consecutive_planning_failures_ >= max_consecutive_planning_failures_) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Giving up: no feasible trajectory for %d consecutive cycles -- infeasible goal.",
+      consecutive_planning_failures_);
+    state_ = ManagerState::kFailed;
+    active_goal_.reset();
+    restoreControllerStopDistOverride();
+  }
 }
 
 void PullOverManagerNode::publishTrajectory(const Trajectory & trajectory)
@@ -743,6 +823,8 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
   // trajectory (see seedAccelerationFromLastTrajectory()).
   last_trajectory_.reset();
   zero_speed_since_.reset();
+  contingency_stop_goal_.reset();
+  consecutive_traffic_blocked_cycles_ = 0;
 
   if (require_autonomous_mode_ && !autonomous_mode_engaged_) {
     const std::string message =
