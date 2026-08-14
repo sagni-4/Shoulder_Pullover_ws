@@ -216,13 +216,23 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   // above only catches a meaningfully *negative* raw position from a
   // nonzero start acceleration; it says nothing about a genuine v0=0, a0=0
   // start, whose quintic is flat (zero position, slope, and curvature) at
-  // t=0 by construction -- the position for the first several samples can
-  // be a real, non-negative, but vanishingly small number, clamping to
-  // *arc-length* increments too small to trust as physically meaningful
-  // forward progress even though they're technically nonzero doubles.
-  // Reject outright (search moves on to the next candidate) rather than
-  // silently accept -- same policy as the check above, for the same reason.
-  constexpr double kMinArcLengthStep = 1e-4;  // 0.1mm; below this, don't trust it as real progress.
+  // t=0 by construction. All the downstream check
+  // (autoware_interpolation::validateKeys, via isIncreasing) actually
+  // requires is strict `>` between consecutive keys -- no minimum step size.
+  // An earlier version of this guard used 1e-4 (0.1mm) as a "trust this as
+  // real progress" heuristic, but that's larger than a genuine v0=0,a0=0
+  // quintic's first ~100ms sample for any but the shortest candidate
+  // durations (its leading term is cubic in t from a standing start), so it
+  // was silently discarding *every* long-duration candidate for a true
+  // full-stop departure -- live-verified 2026-08-12: the spiral shape solved
+  // fine but never produced a single candidate across its whole duration
+  // sweep once the vehicle was genuinely at v=0,a=0, which is exactly the
+  // state the reactive controller-departure override is meant to unstick.
+  // Use an epsilon just above floating-point noise (arc lengths here are
+  // O(1-100m), so ~1e-9 is ~1e5x the double-precision noise floor) instead --
+  // still rejects genuine clamped-duplicate ties, no longer rejects real
+  // sub-millimeter forward creep.
+  constexpr double kMinArcLengthStep = 1e-9;
   double previous_s = std::clamp(qs.position(0.0), 0.0, shape.length());
   for (int i = 1; i < num_samples; ++i) {
     const double t_check = std::min(duration, i * params_.dt);
@@ -253,8 +263,22 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
     // needed here.
     point.pose.orientation = quaternionFromYaw(path_point.yaw);
 
+    // Floor only the *published reference*, never the true v0 boundary
+    // condition the quintic itself was solved with -- see
+    // min_departure_reference_speed's docs for why a genuine v0=0 sample
+    // needs this to avoid a mutual deadlock with stock Autoware's own
+    // control stack. Gated by remaining arc length (see
+    // final_approach_distance's docs): only while genuinely far from the
+    // goal, so the last final_approach_distance meters can still decelerate
+    // smoothly all the way to a real stop instead of being artificially
+    // held above the floor right up to the last sample.
     const double speed = std::max(0.0, qs.velocity(t));
-    point.longitudinal_velocity_mps = static_cast<float>(is_last ? 0.0 : speed);
+    const double remaining_arc_length = shape.length() - s;
+    const double departure_floor = remaining_arc_length > params_.final_approach_distance
+                                      ? params_.min_departure_reference_speed
+                                      : 0.0;
+    point.longitudinal_velocity_mps =
+      static_cast<float>(is_last ? 0.0 : std::max(speed, departure_floor));
     point.lateral_velocity_mps = 0.0F;
     // Tangential acceleration is exact and direct now that s(t) *is* the
     // longitudinal coordinate -- no vx/vy projection needed.
@@ -279,6 +303,21 @@ bool PullOverTrajectoryPlanner::satisfiesKinematicConstraints(
 
   for (std::size_t i = 0; i + 1 < trajectory.points.size(); ++i) {
     const double speed = trajectory.points[i].longitudinal_velocity_mps;
+
+    // Unconditional (not speed-gated like the checks below) -- this is the
+    // check that catches the speed itself running away, so it must never be
+    // skippable. See max_speed's docs for the live near-miss that motivated
+    // this: a receding-horizon quintic solved from a growing v0 can overshoot
+    // well above both its own boundary speeds in the middle samples.
+    if (speed > params_.max_speed) {
+      if (failure_reason) {
+        std::ostringstream oss;
+        oss << "speed " << speed << " m/s exceeds max " << params_.max_speed << " m/s at point "
+            << i;
+        *failure_reason = oss.str();
+      }
+      return false;
+    }
 
     // Below this speed, path curvature computed from finite differences
     // (dyaw/segment_length) is numerically ill-conditioned -- segment_length

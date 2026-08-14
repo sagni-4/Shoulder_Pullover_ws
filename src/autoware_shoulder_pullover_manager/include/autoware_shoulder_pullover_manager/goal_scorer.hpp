@@ -166,6 +166,23 @@ struct GoalScorerParams
   /// gives a heading that reflects the shoulder's actual local direction
   /// instead of one sample's noise.
   double heading_smoothing_distance{3.0};
+
+  /// Live-verified bug, 2026-08-13: candidates farther than this were selected and then failed
+  /// PullOverTrajectoryPlanner::plan() every single cycle up to max_consecutive_planning_failures_,
+  /// not from a search gap but a hard mathematical ceiling -- a minimum-jerk quintic position
+  /// profile connecting near-zero boundary speeds at both ends has PEAK velocity approximately
+  /// (15/8) * (distance/duration) (standard result for a 5th-order polynomial with zero
+  /// velocity+acceleration at both endpoints). Bag-confirmed live: a 20.2m goal, searched up to
+  /// trajectory_duration's own cap (15s), peaked at ~2.0-2.03 m/s against a 2.0 m/s
+  /// trajectory_max_speed ceiling -- no duration up to that cap can ever bring a candidate this
+  /// far under the speed ceiling, so PullOverTrajectoryPlanner::plan()'s whole duration search was
+  /// guaranteed to fail before ever being tried. Must be populated by the owning node from
+  /// PullOverTrajectoryPlanner's own params (max_speed, max_duration) so the two stay physically
+  /// consistent -- see pull_over_manager_node.cpp's constructor. Defaults to a value consistent
+  /// with this class's own stock defaults (2.0 m/s, 15s) with a ~10% safety margin below the
+  /// exact analytic ceiling, since the real check is a discretized per-sample one, not the exact
+  /// continuous peak.
+  double max_reachable_distance{14.4};
 };
 
 /// A single scored candidate shoulder-goal, with the raw measurements kept

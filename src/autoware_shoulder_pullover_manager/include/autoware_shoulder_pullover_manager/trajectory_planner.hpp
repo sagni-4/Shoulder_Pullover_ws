@@ -46,6 +46,88 @@ struct TrajectoryPlannerParams
   double terminal_approach_speed{0.3};  ///< Small nonzero speed (m/s) used only to keep the
                                          ///< heading boundary condition well-defined near the
                                          ///< stop; the actual last sample is force-zeroed.
+  double min_departure_reference_speed{1.0};  ///< m/s floor applied to the non-last samples'
+                                               ///< published speed, but ONLY while more than
+                                               ///< final_approach_distance of arc length
+                                               ///< remains to the goal (see that field and
+                                               ///< buildCandidate) -- never the true v0, which
+                                               ///< stays the quintic's exact boundary condition.
+                                               ///<
+                                               ///< Live-verified bug, 2026-08-13 (root-caused
+                                               ///< from a recorded rosbag, not guessed): this
+                                               ///< value used to be 0.05, chosen only to clear
+                                               ///< stock Autoware's isStoppedState()/steer-
+                                               ///< convergence mutual-deadlock epsilon (the
+                                               ///< controller reads this same near-ego reference
+                                               ///< speed to decide whether the vehicle is "still
+                                               ///< parked" -- see project memory) -- but 0.05 m/s
+                                               ///< (180 m/h) is not a speed a real vehicle visibly
+                                               ///< moves at, and because this planner is a
+                                               ///< receding-horizon replanner that reads ego's
+                                               ///< *actual* speed as next cycle's v0, publishing
+                                               ///< 0.05 m/s caused actual ego speed to converge to
+                                               ///< ~0.05 m/s and *stay* there indefinitely: bag-
+                                               ///< verified /control/command/control_cmd pinned
+                                               ///< at exactly cmd_v=0.050 for 4+ continuous
+                                               ///< seconds while the vehicle was still ~11m from
+                                               ///< the goal. The self-reinforcing mechanism: once
+                                               ///< real v0 drops under ~1.0 m/s, `plan()`'s
+                                               ///< distance/speed-based initial_guess duration
+                                               ///< saturates at max_duration (15s) for the
+                                               ///< remaining ~11m, so the resulting quintic's
+                                               ///< true velocity value sits below the old 0.05
+                                               ///< floor for a large fraction of its samples --
+                                               ///< which are then all flattened to exactly 0.05,
+                                               ///< so real ego speed never climbs back above it
+                                               ///< and the next cycle repeats the same collapsed
+                                               ///< regime. Raising the constant alone would ruin
+                                               ///< the genuine final decel-to-a-stop the last few
+                                               ///< meters need, hence the distance gate: outside
+                                               ///< final_approach_distance this floor keeps
+                                               ///< real progress large enough to see (1.0 m/s,
+                                               ///< matching the same order of magnitude as
+                                               ///< PullOverManagerNode::min_crawl_speed_ and
+                                               ///< comfortably 1000x above the stock
+                                               ///< isStoppedState() epsilon this field was
+                                               ///< originally added to clear), while inside it
+                                               ///< the true quintic value (including down to
+                                               ///< genuine 0) passes through untouched.
+
+  double final_approach_distance{2.0};  ///< m. Remaining arc length (to the goal) below which
+                                         ///< min_departure_reference_speed's floor stops being
+                                         ///< applied, letting the quintic's own true (possibly
+                                         ///< near-zero) velocity through so the vehicle can
+                                         ///< actually decelerate to a stop at the goal -- see
+                                         ///< that field's docs for the bug this fixes. Physically
+                                         ///< derived, not arbitrary: must be at least the
+                                         ///< kinematic stopping distance from the highest speed
+                                         ///< that could be commanded when this zone is entered,
+                                         ///< d = v^2 / (2*|min_longitudinal_accel|). Worst case
+                                         ///< here is v=trajectory_max_speed=2.0 m/s decelerating
+                                         ///< at min_longitudinal_accel=-2.5 m/s^2: d = 4.0/5.0 =
+                                         ///< 0.8m. The 2.0m default keeps a >2x margin over that
+                                         ///< floor (comfortable, not max-braking, deceleration)
+                                         ///< and stays comfortably inside arrival_distance_threshold_'s
+                                         ///< typical 1.0m in PullOverManagerNode, so the
+                                         ///< arrival check always evaluates speed *after* this
+                                         ///< zone's genuine decel has had room to act.
+  double max_speed{2.0};  ///< m/s. Hard ceiling on every sample's *published* speed, checked
+                           ///< unconditionally in satisfiesKinematicConstraints() (unlike the
+                           ///< curvature/lateral checks below, this is never speed-gated -- it
+                           ///< exists specifically to catch runaway speed itself). Added
+                           ///< 2026-08-12 after a live near-miss: satisfiesKinematicConstraints()
+                           ///< previously checked curvature/lateral-accel/lateral-jerk/
+                           ///< longitudinal-accel but never bounded raw velocity magnitude at
+                           ///< all. A receding-horizon replan starting from a *growing* v0 (e.g.
+                           ///< while recovering from a stuck/STOPPED state) toward a fixed
+                           ///< remaining goal distance can produce a minimum-jerk quintic whose
+                           ///< *middle* samples overshoot well above both boundary speeds even
+                           ///< though every other per-sample check passes -- observed live as
+                           ///< unchecked acceleration to ~9.3 m/s. This is a slow, precision
+                           ///< entry maneuver (see the struct-level comment above), so 2.0 m/s is
+                           ///< a deliberately low ceiling, comfortably under any reasonable
+                           ///< external safety-monitor threshold -- this check should trip
+                           ///< first, not the external monitor.
 
   double min_path_turn_radius{4.0};   ///< m. Tightest DubinsPath turning radius tried (see
                                        ///< buildCandidate/plan) -- curvature=0.25 1/m, under the

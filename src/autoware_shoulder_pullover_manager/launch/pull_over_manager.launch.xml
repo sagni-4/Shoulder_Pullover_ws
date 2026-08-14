@@ -15,6 +15,7 @@
 
   <arg name="arrival_distance_threshold" default="1.0" description="Meters from goal to declare the maneuver succeeded"/>
   <arg name="arrival_speed_threshold" default="0.2" description="m/s below which ego is considered stopped for arrival purposes"/>
+  <arg name="arrival_heading_threshold" default="0.1" description="rad -- ego's heading must also be within this of the goal's before declaring success, in addition to distance+speed, so the vehicle doesn't declare 'arrived' mid-turn (e.g. perpendicular instead of parallel-parked). See pull_over_manager_node.hpp."/>
   <arg name="max_consecutive_planning_failures" default="30" description="Consecutive cycles with no feasible/collision-free trajectory before giving up and reporting failure"/>
   <arg name="max_consecutive_traffic_blocked_cycles" default="300" description="Consecutive cycles spent contingency-braking for traffic blocking the planned path before giving up -- deliberately much more generous than max_consecutive_planning_failures, since waiting for another vehicle/pedestrian to clear can reasonably take much longer than a genuinely-infeasible-goal retry loop should"/>
   <arg name="deceleration_lookahead_distance" default="40.0" description="m -- how far ahead (along ego's current heading) the synthetic straight-line in-lane braking goal is placed each cycle when no shoulder goal is feasible yet at the current speed"/>
@@ -43,6 +44,9 @@
   <arg name="trajectory_max_duration" default="15.0"/>
   <arg name="trajectory_duration_step" default="1.0"/>
   <arg name="trajectory_terminal_approach_speed" default="0.3"/>
+  <arg name="trajectory_min_departure_reference_speed" default="1.0" description="m/s -- floor on the published (not true v0) reference speed for a departure trajectory's non-last samples, applied only outside trajectory_final_approach_distance of the goal. Was 0.05 -- live/bag-verified 2026-08-13 that value let real ego speed collapse to and stick at an imperceptible 0.05 m/s crawl for many seconds mid-maneuver; see trajectory_planner.hpp for the full mechanism."/>
+  <arg name="trajectory_final_approach_distance" default="2.0" description="m -- remaining arc length to the goal below which the departure-reference floor above stops applying, letting the vehicle actually decelerate to a real stop at the goal. Physically derived: must exceed v^2/(2*|trajectory_min_longitudinal_accel|) for the fastest speed this zone is entered at; see trajectory_planner.hpp."/>
+  <arg name="trajectory_max_speed" default="2.0" description="m/s -- hard, unconditional ceiling on every published sample's speed. Added 2026-08-12 after a live near-miss (unchecked acceleration to ~9.3 m/s): a receding-horizon quintic solved from a growing v0 can overshoot well above its own boundary speeds in the middle samples, and no other check in satisfiesKinematicConstraints bounds raw speed. See trajectory_planner.hpp."/>
   <arg name="trajectory_min_path_turn_radius" default="4.0" description="m -- tightest DubinsPath turning radius tried; curvature=0.25 1/m, under the real vehicle kinematic limit (~0.302 1/m, see trajectory_max_curvature)"/>
   <arg name="trajectory_max_path_turn_radius" default="15.0" description="m -- widest turning radius tried before giving up on a goal entirely"/>
   <arg name="trajectory_path_turn_radius_step" default="0.25" description="m -- increment between tried radii; searched (not fixed) because feasibility is non-monotonic in radius, see trajectory_planner.hpp"/>
@@ -55,6 +59,9 @@
   <arg name="trajectory_ego_footprint_radius" default="1.5" description="Circular over-approximation of the ego footprint (m) for collision checking"/>
   <arg name="trajectory_default_object_radius" default="1.0"/>
   <arg name="trajectory_collision_margin" default="1.0"/>
+
+  <arg name="aeb_override_enabled" default="true" description="Temporarily disable AEB's plan-agnostic use_imu_path collision fallback for the duration of an active pull-over maneuver (use_predicted_trajectory, which correctly reflects the actual planned curve, stays enabled) -- see pushAebImuPathOverride() in pull_over_manager_node.hpp for the live-verified false-positive/MRM-escalation bug this fixes."/>
+  <arg name="aeb_node_name" default="/control/autonomous_emergency_braking"/>
 
   <arg name="visualization_width" default="3.0" description="Width (m) of the shaded RViz ribbon published on ~/planned_path_marker -- roughly lane-width by default"/>
   <arg name="visualization_alpha" default="0.6"/>
@@ -71,6 +78,7 @@
     <param name="planning_rate_hz" value="$(var planning_rate_hz)"/>
     <param name="arrival_distance_threshold" value="$(var arrival_distance_threshold)"/>
     <param name="arrival_speed_threshold" value="$(var arrival_speed_threshold)"/>
+    <param name="arrival_heading_threshold" value="$(var arrival_heading_threshold)"/>
     <param name="max_consecutive_planning_failures" value="$(var max_consecutive_planning_failures)"/>
     <param name="max_consecutive_traffic_blocked_cycles" value="$(var max_consecutive_traffic_blocked_cycles)"/>
     <param name="deceleration_lookahead_distance" value="$(var deceleration_lookahead_distance)"/>
@@ -96,6 +104,9 @@
     <param name="trajectory_max_duration" value="$(var trajectory_max_duration)"/>
     <param name="trajectory_duration_step" value="$(var trajectory_duration_step)"/>
     <param name="trajectory_terminal_approach_speed" value="$(var trajectory_terminal_approach_speed)"/>
+    <param name="trajectory_min_departure_reference_speed" value="$(var trajectory_min_departure_reference_speed)"/>
+    <param name="trajectory_final_approach_distance" value="$(var trajectory_final_approach_distance)"/>
+    <param name="trajectory_max_speed" value="$(var trajectory_max_speed)"/>
     <param name="trajectory_min_path_turn_radius" value="$(var trajectory_min_path_turn_radius)"/>
     <param name="trajectory_max_path_turn_radius" value="$(var trajectory_max_path_turn_radius)"/>
     <param name="trajectory_path_turn_radius_step" value="$(var trajectory_path_turn_radius_step)"/>
@@ -108,6 +119,8 @@
     <param name="trajectory_ego_footprint_radius" value="$(var trajectory_ego_footprint_radius)"/>
     <param name="trajectory_default_object_radius" value="$(var trajectory_default_object_radius)"/>
     <param name="trajectory_collision_margin" value="$(var trajectory_collision_margin)"/>
+    <param name="aeb_override_enabled" value="$(var aeb_override_enabled)"/>
+    <param name="aeb_node_name" value="$(var aeb_node_name)"/>
     <param name="visualization_width" value="$(var visualization_width)"/>
     <param name="visualization_alpha" value="$(var visualization_alpha)"/>
   </node>

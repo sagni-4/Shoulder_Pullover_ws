@@ -154,6 +154,13 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
     if (distance > params_.max_lookahead_distance || distance < min_stopping_distance) {
       continue;  // Either unreachably far, or too close to decelerate comfortably.
     }
+    if (distance > params_.max_reachable_distance) {
+      // Farther than any duration up to trajectory_max_duration can cover while respecting
+      // trajectory_max_speed -- see max_reachable_distance's docs. A hard kinematic ceiling,
+      // not a search gap, so reject here rather than let PullOverTrajectoryPlanner discover it
+      // the slow way (max_consecutive_planning_failures_ cycles later).
+      continue;
+    }
 
     // Reject candidates that are not meaningfully ahead of the vehicle --
     // avoids selecting stale waypoints behind ego on the ever-accumulating
@@ -180,8 +187,20 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
     // should match trajectory_planner's max_curvature) -- a candidate
     // this rejects would be rejected by the planner's own preferred shape
     // too, just discovered late instead of up front.
+    //
+    // Must be checked against the *smoothed* heading, not the raw
+    // per-point one: the candidate actually locked in below (and later
+    // handed to PullOverTrajectoryPlanner) uses smoothedHeading(), which
+    // can require meaningfully more curvature than the raw, noisier
+    // per-point heading did (live-verified 2026-08-13 -- a candidate
+    // passed this gate at curvature 0.26 against the raw heading, but the
+    // real solver, targeting the smoothed heading actually committed to,
+    // needed 0.42, well past max_maneuver_curvature, and failed 30
+    // consecutive replanning cycles before giving up).
+    auto goal_pose = centerline_map.poses[i].pose;
+    goal_pose.orientation = smoothedHeading(centerline_map, i);
     const CurvatureSpiralPath maneuver(
-      ego_pose, centerline_map.poses[i].pose, params_.max_maneuver_curvature);
+      ego_pose, goal_pose, params_.max_maneuver_curvature);
     if (!maneuver.valid()) {
       continue;
     }
@@ -215,11 +234,10 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
 
     if (!best.has_value() || score > best->score) {
       ScoredCandidate candidate;
-      candidate.pose = centerline_map.poses[i].pose;
-      // Replace the raw per-point heading with a locally-smoothed tangent --
-      // see smoothedHeading()'s docs. Position stays exactly the raw
-      // waypoint's; only orientation changes.
-      candidate.pose.orientation = smoothedHeading(centerline_map, i);
+      // goal_pose already carries the smoothed heading (see above) --
+      // reuse it as-is so the locked-in candidate is exactly what the
+      // feasibility gate just validated.
+      candidate.pose = goal_pose;
       candidate.score = score;
       candidate.distance_from_ego = distance;
       candidate.curvature = curvature;

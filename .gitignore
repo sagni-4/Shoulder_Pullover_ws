@@ -6,3 +6,4 @@ log/
 *.log
 *.out
 *.toc
+rosbags/

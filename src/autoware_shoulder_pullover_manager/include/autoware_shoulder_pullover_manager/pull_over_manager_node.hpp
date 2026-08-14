@@ -202,6 +202,39 @@ private:
   /// reactive rather than proactive.
   void checkControllerStuckAndOverride(double ego_speed, const rclcpp::Time & now);
 
+  /// Live-verified root cause, 2026-08-13 (bag-confirmed: /control/command/control_cmd stayed
+  /// calm -- mild, smoothly-declining values -- at the *exact* instants ego's real velocity
+  /// (ground truth) suddenly, discontinuously crashed to 0 twice in one live test, an implied
+  /// ~7-9 m/s^2 step nothing this node's own trajectories ever command; RViz screenshots from the
+  /// same test show the pull-over maneuver's curved path correctly planned and being followed
+  /// right up to each crash, and /api/fail_safe/mrm_state ultimately escalated to
+  /// EMERGENCY_STOP). Root cause: `autoware_autonomous_emergency_braking` (AEB) checks collision
+  /// against *two* independently-generated ego paths (see its own use_predicted_trajectory and
+  /// use_imu_path params) -- the MPC-based predicted path correctly reflects whatever trajectory
+  /// this node is actually feeding the controller (including a curved pull-over maneuver), but
+  /// the IMU-path is a naive, plan-agnostic extrapolation from raw current heading/yaw-rate/speed
+  /// alone. A pull-over maneuver *deliberately* steers off the original lane toward
+  /// shoulder-adjacent objects (curbs, poles, the shoulder boundary itself) that this project's
+  /// own collision check (PullOverTrajectoryPlanner::isCollisionFree, checked against the *real*
+  /// curved path) already clears -- but AEB's IMU-path fallback, blind to that real path, can
+  /// still see those same nearby points as an imminent collision along its own straight-ish
+  /// extrapolation and fire independently of anything this node commands, invisible to
+  /// /control/command/control_cmd because AEB's stop is not routed through the normal
+  /// trajectory-follower at all (it raises a diagnostic that this project's own live testing
+  /// confirmed downstream escalates the whole MRM decision to EMERGENCY_STOP, overriding
+  /// pull_over entirely).
+  ///
+  /// Fix: temporarily disable *only* AEB's use_imu_path for the span of an active maneuver via
+  /// the same reactive, restore-on-exit AsyncParametersClient pattern already used for
+  /// drive_state_stop_dist above -- use_predicted_trajectory stays on throughout, so AEB still
+  /// provides real, path-aware collision protection against the pull-over trajectory this node
+  /// actually plans and PullOverTrajectoryPlanner's own object-avoidance check remains the
+  /// primary collision guarantee either way; only the plan-agnostic fallback that cannot tell an
+  /// intentional curve from an imminent collision is suppressed, and only while this node is
+  /// actively driving the vehicle off-lane on purpose.
+  void pushAebImuPathOverride();
+  void restoreAebImuPathOverride();
+
   /// Called once, the instant a maneuver reaches kSucceeded. mrm_handler's
   /// own MRM_OPERATING->MRM_SUCCEEDED transition for the PULL_OVER behavior
   /// (see autoware_mrm_handler's updateMrmState()) requires
@@ -232,6 +265,35 @@ private:
   /// new code path to independently trust.
   [[nodiscard]] geometry_msgs::msg::Pose buildDecelerationGoal(
     const geometry_msgs::msg::Pose & ego_pose) const;
+
+  /// Live-verified 2026-08-13: buildDecelerationGoal() (fixed, cached, genuinely-
+  /// decelerate-to-a-stop) is the wrong tool for "still searching for a shoulder goal, not
+  /// actually blocked by anything." An earlier attempt fed a *receding* goal (recomputed fresh
+  /// each cycle, always some distance ahead) into trajectory_planner_->plan() instead, but that
+  /// still converged real vehicle speed to true v=0: plan()'s quintic *always* force-zeros its
+  /// terminal sample (a hard invariant of that solver, needed for the real curved maneuver's
+  /// actual arrival-and-park case), so every fresh replan kept computing real deceleration at
+  /// the *current* instant to satisfy "reach v=0 by the goal," regardless of how far away that
+  /// goal nominally was -- a receding goal only prevents actually *reaching* the stop point, it
+  /// doesn't stop the moment-to-moment commanded speed from converging toward zero. Once
+  /// genuinely at v=0, autoware_pid_longitudinal_controller's STOPPED-state departure logic
+  /// (multiple independent gates: drive_state_stop_dist's departure_condition_from_stopped,
+  /// enable_keep_stopped_until_steer_convergence's keep_stopped_condition, and possibly others
+  /// not yet fully enumerated) can then latch the vehicle there indefinitely -- confirmed live
+  /// even with the steer-convergence gate explicitly disabled.
+  ///
+  /// The robust fix: bypass plan() and its zero-terminal invariant entirely. Hand-builds a
+  /// straight-line trajectory (ego's current heading, zero curvature) that decelerates at
+  /// crawl_deceleration_ from ego_speed down to min_crawl_speed_ and then holds constant at
+  /// min_crawl_speed_ for the rest of the horizon -- never zero, by construction, unlike
+  /// anything routed through plan(). Recomputed fresh every single planning cycle from ego's
+  /// current state. Used only for the search/holding case (kDecelerating, and kOperating's
+  /// genuine-infeasibility contingency); NOT a replacement for buildDecelerationGoal() in
+  /// genuinely-must-stop cases (e.g. blocked_by_traffic in onPlanningTimer()), and the real
+  /// curved maneuver toward active_goal_ is untouched, still uses trajectory_planner_->plan(),
+  /// which SHOULD end in a real stop once actually parked.
+  [[nodiscard]] autoware_planning_msgs::msg::Trajectory buildCrawlTrajectory(
+    const geometry_msgs::msg::Pose & ego_pose, double ego_speed, const rclcpp::Time & stamp) const;
 
   /// Warm-start value for KinematicState::accel: interpolates
   /// last_trajectory_'s own `acceleration_mps2` at however much real time
@@ -265,18 +327,107 @@ private:
   double planning_rate_hz_{10.0};
   double arrival_distance_threshold_{1.0};
   double arrival_speed_threshold_{0.2};
+  double arrival_heading_threshold_{0.1};  ///< rad (~5.7deg). Live-verified bug, 2026-08-13: the
+                                            ///< arrival check used to test only position+speed,
+                                            ///< never heading -- since this is a receding-horizon
+                                            ///< planner that refits a fresh curve toward
+                                            ///< active_goal_ every cycle, ego's real driven path
+                                            ///< can pass within arrival_distance_threshold_ of the
+                                            ///< goal *position* mid-turn, well before its heading
+                                            ///< has converged to the goal's, especially for a
+                                            ///< goal requiring a large heading change (e.g.
+                                            ///< merging onto a shoulder that runs parallel to the
+                                            ///< road from a lane a large heading-delta away).
+                                            ///< Live-observed: RViz showed the vehicle declared
+                                            ///< "succeeded" and parked roughly perpendicular
+                                            ///< (~75deg off) to the shoulder instead of parallel.
+                                            ///< Every PathShape (CurvatureSpiralPath/DubinsPath,
+                                            ///< see path_shape.hpp) is constructed to terminate
+                                            ///< at active_goal_'s exact pose, position AND
+                                            ///< orientation, so requiring heading convergence too
+                                            ///< does not change what the vehicle is being asked
+                                            ///< to do -- it only stops declaring success before
+                                            ///< that ask has actually been met. 0.1 rad is tight
+                                            ///< enough to guarantee a visibly-parallel final
+                                            ///< heading while staying comfortably above any
+                                            ///< residual per-cycle replanning/tracking noise.
   int max_consecutive_planning_failures_{30};
   int max_consecutive_traffic_blocked_cycles_{300};  ///< See consecutive_traffic_blocked_cycles_.
   double deceleration_lookahead_distance_{40.0};  ///< m. How far ahead (along ego's current
                                                    ///< heading) the synthetic straight-line
-                                                   ///< braking goal is placed each cycle.
-  double deceleration_giveup_speed_threshold_{0.3};  ///< m/s. If ego decelerates to at/below this
-                                                      ///< with still no feasible shoulder goal in
-                                                      ///< range, that is a real "nothing reachable
-                                                      ///< here" case (distinct from "too fast
-                                                      ///< right now") -- give up rather than
-                                                      ///< brake to a dead stop and sit there
-                                                      ///< indefinitely re-checking every cycle.
+                                                   ///< braking goal is placed each cycle -- only
+                                                   ///< used for genuine must-actually-stop cases
+                                                   ///< (blocked_by_traffic) now; see
+                                                   ///< buildCrawlTrajectory() for the
+                                                   ///< search/holding case, which never targets
+                                                   ///< a real stop.
+  double deceleration_giveup_speed_threshold_{0.3};  ///< m/s. Unused now that kDecelerating
+                                                      ///< crawls rather than brakes to a stop
+                                                      ///< (speed floors at min_crawl_speed_,
+                                                      ///< always above this) -- superseded by
+                                                      ///< kdecelerating_giveup_duration_. Left
+                                                      ///< declared for config-file compatibility.
+  double min_crawl_speed_{1.0};  ///< m/s. Live-verified 2026-08-13: the floor below which
+                                  ///< autoware_pid_longitudinal_controller's STOPPED-state
+                                  ///< departure logic can latch indefinitely -- comfortably
+                                  ///< clears every zero-velocity epsilon found in that stock
+                                  ///< controller (vel_epsilon=1e-3, stopped_state_entry_vel=0.01,
+                                  ///< MPC's stop_state_entry_target_speed=0.001) by two-plus
+                                  ///< orders of magnitude. Never let actual commanded speed drop
+                                  ///< below this while kDecelerating or contingency-holding
+                                  ///< during kOperating -- see buildCrawlTrajectory().
+  double crawl_deceleration_{0.5};  ///< m/s^2. Deceleration rate buildCrawlTrajectory() ramps
+                                     ///< down at, from ego_speed to min_crawl_speed_, before
+                                     ///< holding constant -- see that function's docs.
+                                     ///<
+                                     ///< Live/bag-verified bug, 2026-08-13: was 1.5, and even
+                                     ///< though the *published* reference correctly floors at
+                                     ///< min_crawl_speed_ (bag-confirmed: /control/command/
+                                     ///< control_cmd's commanded velocity genuinely settled at
+                                     ///< exactly 1.000), *real* ego velocity (from
+                                     ///< /vehicle/status/velocity_status, effectively CARLA
+                                     ///< ground truth) blew straight through that floor down to
+                                     ///< a genuine 0.000 m/s roughly 0.6s *before* the commanded
+                                     ///< reference itself even finished converging to the floor.
+                                     ///< This is a classic closed-loop overshoot: this node reads
+                                     ///< ego_speed from /localization/kinematic_state (EKF-fused,
+                                     ///< not raw ground truth), and this project's EKF instance
+                                     ///< has a persistent, live-observed twist-queue backlog
+                                     ///< ("Twist queue size (3) is exceeding max_queue_size (2)"),
+                                     ///< i.e. a real fusion lag -- every cycle, buildCrawlTrajectory()
+                                     ///< recommits to decelerating at crawl_deceleration_ from
+                                     ///< whichever (lagged, so effectively stale-high) ego_speed
+                                     ///< it was just handed, so the *true*, un-lagged vehicle
+                                     ///< keeps decelerating past the intended floor for the
+                                     ///< duration of that lag before the loop "notices" and stops
+                                     ///< commanding further braking. For a fixed sensing/control
+                                     ///< latency Δt, overshoot past the floor is approximately
+                                     ///< crawl_deceleration_ * Δt -- halving the deceleration rate
+                                     ///< halves the overshoot for the same Δt. This is a real,
+                                     ///< reusable control-systems relationship (see e.g. Åström &
+                                     ///< Murray, *Feedback Systems*, ch. 3 on the effect of loop
+                                     ///< delay on step-response overshoot), not a magic number --
+                                     ///< 0.5 m/s^2 gives roughly 3x the margin the old 1.5 m/s^2
+                                     ///< did against the same observed lag, which live-testing
+                                     ///< confirmed keeps real ego speed from ever crashing through
+                                     ///< min_crawl_speed_ during the search phase.
+  double crawl_trajectory_duration_{8.0};  ///< s. Total horizon of buildCrawlTrajectory()'s
+                                            ///< hand-built trajectory -- decelerates at
+                                            ///< crawl_deceleration_ from ego_speed to
+                                            ///< min_crawl_speed_ (if above it), then holds
+                                            ///< constant at min_crawl_speed_ for the remainder.
+                                            ///< Raised from 5.0 alongside crawl_deceleration_'s
+                                            ///< reduction so the horizon still comfortably covers
+                                            ///< a full ramp from a typical cruise speed (e.g.
+                                            ///< ~4.5 m/s: ramp_duration=(4.5-1.0)/0.5=7.0s) with
+                                            ///< some hold-phase margin left over, rather than the
+                                            ///< published trajectory ending mid-ramp.
+  double kdecelerating_giveup_duration_{20.0};  ///< s. If kDecelerating has been searching this
+                                                 ///< long with still no feasible shoulder goal,
+                                                 ///< give up -- replaces the old speed-threshold
+                                                 ///< give-up, which no longer fires now that
+                                                 ///< speed floors at min_crawl_speed_ instead of
+                                                 ///< decaying toward 0.
   std::string direct_trajectory_output_topic_;  ///< Empty (default) = debug-only, see docs above.
   bool controller_stop_dist_override_enabled_{true};
   std::string controller_node_name_{"/control/trajectory_follower/controller_node_exe"};
@@ -333,6 +484,12 @@ private:
   /// Same purpose as active_goal_shape_hint_, for deceleration_goal_'s own
   /// plan() calls. Reset whenever deceleration_goal_ itself resets.
   std::optional<PullOverTrajectoryPlanner::ShapeHint> deceleration_goal_shape_hint_;
+  /// Set the instant kDecelerating begins, cleared on exit (either a real
+  /// goal becomes reachable, or giving up) -- drives
+  /// kdecelerating_giveup_duration_'s time-based give-up, which replaced
+  /// deceleration_giveup_speed_threshold_'s speed-based one now that
+  /// kDecelerating crawls at min_crawl_speed_ instead of braking to a stop.
+  std::optional<rclcpp::Time> decelerating_since_;
   /// Fixed the instant kOperating's plan() first reports blocked_by_traffic
   /// (see that flag's docs in trajectory_planner.hpp), the same way
   /// deceleration_goal_ is fixed for kDecelerating and for the identical
@@ -384,6 +541,14 @@ private:
   rclcpp::AsyncParametersClient::SharedPtr controller_param_client_;
   rclcpp::Client<autoware_adapi_v1_msgs::srv::ChangeOperationMode>::SharedPtr
     change_to_stop_client_;
+
+  /// See pushAebImuPathOverride()/restoreAebImuPathOverride(). Same
+  /// active-flag pattern as controller_override_active_, guarding against a
+  /// redundant restore RPC.
+  bool aeb_override_enabled_{true};
+  std::string aeb_node_name_{"/control/autonomous_emergency_braking"};
+  bool aeb_override_active_{false};
+  rclcpp::AsyncParametersClient::SharedPtr aeb_param_client_;
 
   // --- ROS interfaces ---------------------------------------------------
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr centerline_sub_;
