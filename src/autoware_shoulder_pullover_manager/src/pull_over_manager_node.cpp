@@ -708,6 +708,8 @@ void PullOverManagerNode::onPlanningTimer()
         deceleration_goal_shape_hint_.reset();
         decelerating_since_.reset();
         consecutive_planning_failures_ = 0;
+        last_attempted_curvature_ = 0.0;
+        consecutive_curvature_increases_ = 0;
         state_ = ManagerState::kOperating;
         return;  // Let the next cycle (100ms away) build the real pull-over trajectory.
       }
@@ -808,6 +810,8 @@ void PullOverManagerNode::onPlanningTimer()
       contingency_stop_goal_.reset();
       contingency_stop_goal_shape_hint_.reset();
       consecutive_planning_failures_ = 0;
+      last_attempted_curvature_ = 0.0;
+      consecutive_curvature_increases_ = 0;
       consecutive_traffic_blocked_cycles_ = 0;
       state_ = ManagerState::kDecelerating;
       decelerating_since_ = now();
@@ -824,13 +828,17 @@ void PullOverManagerNode::onPlanningTimer()
   std::string failure_reason;
   bool blocked_by_traffic = false;
   PullOverTrajectoryPlanner::ShapeHint used_hint;
+  double attempted_curvature = 0.0;
   const auto trajectory = trajectory_planner_->plan(
     start, *active_goal_, latest_objects_, plan_stamp, &failure_reason, &blocked_by_traffic,
-    active_goal_shape_hint_ ? &*active_goal_shape_hint_ : nullptr, &used_hint);
+    active_goal_shape_hint_ ? &*active_goal_shape_hint_ : nullptr, &used_hint,
+    &attempted_curvature);
 
   if (trajectory.has_value()) {
     active_goal_shape_hint_ = used_hint;
     consecutive_planning_failures_ = 0;
+    last_attempted_curvature_ = 0.0;
+    consecutive_curvature_increases_ = 0;
     consecutive_traffic_blocked_cycles_ = 0;
     contingency_stop_goal_.reset();
     contingency_stop_goal_shape_hint_.reset();
@@ -921,11 +929,52 @@ void PullOverManagerNode::onPlanningTimer()
   // (something is physically in the way) so it deliberately keeps the real
   // braking goal through plan().
   ++consecutive_planning_failures_;
+
+  // Track whether the attempted curvature is trending worse cycle to cycle -- see
+  // consecutive_curvature_increases_'s docs for the full mechanism this catches (crawling
+  // straight while retrying a fixed goal can only shrink distance without correcting heading,
+  // so a marginal goal's required curvature can only climb). Only start counting once already
+  // past the early-warning fraction of the cap, so ordinary noise near a comfortably-feasible
+  // goal doesn't trip this.
+  const double curvature_early_warning_threshold =
+    curvature_trend_early_warning_fraction_ * trajectory_params_.max_curvature;
+  if (
+    attempted_curvature > last_attempted_curvature_ &&
+    attempted_curvature > curvature_early_warning_threshold) {
+    ++consecutive_curvature_increases_;
+  } else {
+    consecutive_curvature_increases_ = 0;
+  }
+  last_attempted_curvature_ = attempted_curvature;
+
   RCLCPP_WARN(
     get_logger(),
     "No feasible trajectory found this cycle (%d/%d consecutive). Last reason: %s",
     consecutive_planning_failures_, max_consecutive_planning_failures_, failure_reason.c_str());
   publishTrajectory(buildCrawlTrajectory(ego_pose, ego_speed, plan_stamp));
+
+  if (consecutive_curvature_increases_ >= max_consecutive_curvature_increases_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Abandoning active goal: attempted curvature has worsened for %d consecutive cycles (now "
+      "%.4f, past the %.4f early-warning threshold under the %.2f cap) -- crawling straight "
+      "while retrying this goal can only make its geometry worse, not better. Returning to "
+      "search instead of grinding through the full %d-cycle give-up budget.",
+      consecutive_curvature_increases_, attempted_curvature, curvature_early_warning_threshold,
+      trajectory_params_.max_curvature, max_consecutive_planning_failures_);
+    active_goal_.reset();
+    active_goal_shape_hint_.reset();
+    contingency_stop_goal_.reset();
+    contingency_stop_goal_shape_hint_.reset();
+    consecutive_planning_failures_ = 0;
+    last_attempted_curvature_ = 0.0;
+    consecutive_curvature_increases_ = 0;
+    consecutive_traffic_blocked_cycles_ = 0;
+    state_ = ManagerState::kDecelerating;
+    decelerating_since_ = now();
+    return;
+  }
+
   if (consecutive_planning_failures_ >= max_consecutive_planning_failures_) {
     RCLCPP_ERROR(
       get_logger(),
@@ -1160,6 +1209,8 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
 
   active_goal_ = goal->pose;
   consecutive_planning_failures_ = 0;
+  last_attempted_curvature_ = 0.0;
+  consecutive_curvature_increases_ = 0;
   state_ = ManagerState::kOperating;
   return {true, "Pull-over trajectory planning started toward the selected shoulder goal."};
 }

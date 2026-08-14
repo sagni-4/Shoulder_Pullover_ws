@@ -460,7 +460,8 @@ bool PullOverTrajectoryPlanner::isCollisionFree(
 std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
   const PredictedObjects & objects, const rclcpp::Time & stamp, std::string * failure_reason,
-  bool * blocked_by_traffic, const ShapeHint * preferred_hint, ShapeHint * used_hint) const
+  bool * blocked_by_traffic, const ShapeHint * preferred_hint, ShapeHint * used_hint,
+  double * out_attempted_curvature) const
 {
   if (blocked_by_traffic) {
     *blocked_by_traffic = false;
@@ -628,6 +629,9 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   // failed" and "spiral never even converged" look identical if only the
   // Dubins fallback's reason survives -- see project memory for how much
   // offline re-derivation that ambiguity cost before this was added.
+  if (out_attempted_curvature) {
+    *out_attempted_curvature = spiral.attemptedPeakCurvature();
+  }
   if (failure_reason) {
     std::ostringstream oss;
     oss << spiral_shape_diagnostic;

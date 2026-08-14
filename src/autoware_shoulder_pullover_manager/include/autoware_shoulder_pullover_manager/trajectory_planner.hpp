@@ -374,11 +374,20 @@ public:
   /// `preferred_hint` succeeding again or a fresh search finding something
   /// new) -- callers should feed this back in as next cycle's
   /// `preferred_hint`. Left unmodified if plan() returns std::nullopt.
+  ///
+  /// If `out_attempted_curvature` is non-null and plan() fails (returns std::nullopt), it is
+  /// set to the preferred spiral shape's CurvatureSpiralPath::attemptedPeakCurvature() for this
+  /// call -- 0.0 if that shape's Newton solve never converged at all. Lets a caller retrying the
+  /// *same* goal across consecutive cycles (e.g. PullOverManagerNode's kOperating loop) detect a
+  /// worsening-curvature trend and abandon early, rather than only seeing a pass/fail bit each
+  /// cycle -- see that loop's forward-progress-collapse abandon check for the sibling geometric
+  /// signal this complements.
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> plan(
     const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
     const autoware_perception_msgs::msg::PredictedObjects & objects, const rclcpp::Time & stamp,
     std::string * failure_reason = nullptr, bool * blocked_by_traffic = nullptr,
-    const ShapeHint * preferred_hint = nullptr, ShapeHint * used_hint = nullptr) const;
+    const ShapeHint * preferred_hint = nullptr, ShapeHint * used_hint = nullptr,
+    double * out_attempted_curvature = nullptr) const;
 
 private:
   /// Coefficients of a scalar quintic q(t) = c0 + c1 t + c2 t^2 + c3 t^3 +

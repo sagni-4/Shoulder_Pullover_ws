@@ -107,6 +107,15 @@ public:
   /// required maneuver among otherwise-feasible candidates).
   [[nodiscard]] double peakCurvature() const { return peak_curvature_; }
 
+  /// Peak |curvature| (1/m) the Newton solve actually converged to, even when it exceeds
+  /// max_curvature and valid() is therefore false -- 0.0 if the solve never converged at all
+  /// (see give_up_reason in that case; there is no curvature estimate to report). Added so a
+  /// caller retrying against the same goal across consecutive receding-horizon cycles (e.g.
+  /// PullOverManagerNode's kOperating loop) can track *how much* an infeasible attempt is
+  /// missing by and detect a worsening trend, instead of only getting a pass/fail bit each
+  /// cycle -- see PullOverManagerNode's min_maneuver_forward_progress-adjacent abandon logic.
+  [[nodiscard]] double attemptedPeakCurvature() const { return attempted_peak_curvature_; }
+
   /// d(curvature)/d(arc length) at s=0 (1/m^2), signed. Only meaningful if
   /// valid(). Exposed for exactly one reason: curvature is forced to
   /// *exactly* 0 at s=0 (see class docs), so it always ramps up from
@@ -132,6 +141,7 @@ private:
   bool valid_{false};
   double length_{0.0};
   double peak_curvature_{0.0};
+  double attempted_peak_curvature_{0.0};
   double initial_curvature_rate_{0.0};
 
   /// Dense, evenly-spaced-in-arc-length sample table built once at

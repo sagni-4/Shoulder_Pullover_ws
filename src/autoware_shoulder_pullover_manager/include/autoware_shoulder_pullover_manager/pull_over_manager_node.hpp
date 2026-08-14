@@ -504,6 +504,62 @@ private:
   /// own plan() calls. Reset whenever contingency_stop_goal_ itself resets.
   std::optional<PullOverTrajectoryPlanner::ShapeHint> contingency_stop_goal_shape_hint_;
   int consecutive_planning_failures_{0};
+  /// Peak curvature the trajectory planner's spiral attempt converged to on the most recent
+  /// genuine (non-traffic-blocked) planning failure against active_goal_ -- see
+  /// consecutive_curvature_increases_'s docs for why this is tracked cycle to cycle instead of
+  /// just discarded like the rest of plan()'s per-cycle output. Reset to 0.0 alongside
+  /// consecutive_planning_failures_ (fresh goal committed, or a cycle succeeds again).
+  double last_attempted_curvature_{0.0};
+  /// Consecutive genuine-infeasibility cycles in which the attempted spiral curvature both (a)
+  /// increased from the previous cycle and (b) already exceeds
+  /// curvature_trend_early_warning_fraction_ * trajectory_params_.max_curvature. Reset to 0
+  /// alongside consecutive_planning_failures_.
+  ///
+  /// Why this exists: buildCrawlTrajectory() (used while retrying a genuinely-infeasible goal,
+  /// see onPlanningTimer()) deliberately moves ego in a straight line along its *current*
+  /// heading rather than curving toward active_goal_ -- necessary to avoid re-triggering the
+  /// stock longitudinal controller's STOPPED-state departure deadlock (see that function's
+  /// docs), but as an unavoidable geometric consequence it cannot reduce the heading error to a
+  /// goal it isn't steering toward. Every cycle spent crawling while retrying the *same* fixed
+  /// goal therefore shrinks the remaining distance without correcting heading, which can only
+  /// make the curvature required to still reach that goal increase -- confirmed live 2026-08-14:
+  /// a goal that scored comfortably feasible (curvature 0.1865) at selection time climbed to
+  /// 0.237, then past the 0.27 cap up to 0.618, over the standard 30-cycle
+  /// max_consecutive_planning_failures_ give-up budget (~10.5s), while ego kept crawling forward
+  /// the whole time instead of holding position. min_maneuver_forward_progress (see
+  /// GoalScorer) exists to catch exactly this kind of geometric collapse but does not reliably
+  /// trip in time for every such case, since "forward room" and "curvature margin" are related
+  /// but not the same signal -- this is the direct, solver-reported version of the same check,
+  /// answering "is this specific attempt getting worse" rather than approximating it
+  /// geometrically. This is a *detection* mechanism only, not a substitute for
+  /// min_maneuver_forward_progress or for max_curvature itself -- do not raise max_curvature to
+  /// chase this failure mode (see its own docs for why that was already tried and reverted).
+  int consecutive_curvature_increases_{0};
+  double curvature_trend_early_warning_fraction_{0.8};  ///< Fraction of
+                                                          ///< trajectory_params_.max_curvature
+                                                          ///< above which an increasing attempt
+                                                          ///< starts counting toward
+                                                          ///< max_consecutive_curvature_increases_
+                                                          ///< -- below this fraction, an
+                                                          ///< increasing-but-still-comfortable
+                                                          ///< curvature is not worth abandoning
+                                                          ///< over (e.g. ordinary cycle-to-cycle
+                                                          ///< search noise near a well-scored
+                                                          ///< goal).
+  int max_consecutive_curvature_increases_{3};  ///< Abandon active_goal_ (return to kDecelerating
+                                                 ///< / search) once this many consecutive cycles
+                                                 ///< show a worsening curvature trend past
+                                                 ///< curvature_trend_early_warning_fraction_,
+                                                 ///< instead of grinding through the full
+                                                 ///< max_consecutive_planning_failures_ budget
+                                                 ///< while crawling straight into a geometry that
+                                                 ///< can only get worse. Deliberately much smaller
+                                                 ///< than max_consecutive_planning_failures_ (30):
+                                                 ///< that budget still exists for goals whose
+                                                 ///< failure reason isn't curvature-trending (e.g.
+                                                 ///< jerk/accel limits at a roughly-constant
+                                                 ///< curvature), where retrying as-is can still
+                                                 ///< recover.
   /// Cycles the *real* pull-over maneuver has spent blocked by traffic
   /// (contingency-braking instead of progressing toward active_goal_) --
   /// separate from consecutive_planning_failures_ so genuinely waiting for

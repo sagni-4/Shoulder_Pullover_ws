@@ -274,6 +274,10 @@ CurvatureSpiralPath::CurvatureSpiralPath(
     }
     return;
   }
+  // Record the converged attempt's peak curvature even when it exceeds max_curvature below --
+  // see attemptedPeakCurvature()'s docs for why this is exposed despite valid_ becoming false.
+  attempted_peak_curvature_ = best.max_curvature_found;
+
   if (best.max_curvature_found > max_curvature) {
     valid_ = false;
     if (diagnostic) {
