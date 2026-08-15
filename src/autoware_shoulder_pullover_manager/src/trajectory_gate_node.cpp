@@ -25,6 +25,8 @@ TrajectoryGateNode::TrajectoryGateNode(const rclcpp::NodeOptions & options)
     declare_parameter<std::string>("output_trajectory_topic", "/planning/trajectory_gate/output");
   const double hold_publish_rate_hz =
     declare_parameter<double>("hold_publish_rate_hz", 10.0);
+  trajectory_staleness_timeout_ =
+    declare_parameter<double>("trajectory_staleness_timeout", trajectory_staleness_timeout_);
 
   output_pub_ = create_publisher<Trajectory>(output_trajectory_topic, rclcpp::QoS(1));
 
@@ -84,6 +86,7 @@ void TrajectoryGateNode::onPulloverTrajectory(const Trajectory::ConstSharedPtr m
   // status topic to agree.
   latched_ = true;
   holding_ = false;
+  last_pullover_trajectory_time_ = now();
   output_pub_->publish(*msg);
 }
 
@@ -92,13 +95,11 @@ void TrajectoryGateNode::onPulloverStatus(const MrmBehaviorStatus::ConstSharedPt
   if (msg->state == MrmBehaviorStatus::OPERATING) {
     latched_ = true;
     holding_ = false;
-  } else if (latched_) {
-    // Left OPERATING after having been engaged at least once -- the pull-over
-    // manager itself stops replanning/publishing the instant this happens
-    // (see PullOverManagerNode::onPlanningTimer), so from here on this node
-    // is the only thing keeping a fresh trajectory flowing at all.
-    holding_ = true;
   }
+  // Deliberately no else-branch reacting to a non-OPERATING status here -- see class docs for
+  // why: onHoldTimer() decides whether to actually hold from pull-over trajectory *staleness*
+  // instead, since this status topic can blip non-OPERATING for a single cycle while
+  // pull_over_manager_node is still actively publishing real trajectories.
 }
 
 void TrajectoryGateNode::onOdometry(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
@@ -108,9 +109,18 @@ void TrajectoryGateNode::onOdometry(const nav_msgs::msg::Odometry::ConstSharedPt
 
 void TrajectoryGateNode::onHoldTimer()
 {
-  if (!holding_ || !latest_odometry_.has_value()) {
+  if (!latched_ || !latest_odometry_.has_value()) {
     return;
   }
+  const bool trajectory_is_stale =
+    !last_pullover_trajectory_time_.has_value() ||
+    (now() - *last_pullover_trajectory_time_).seconds() > trajectory_staleness_timeout_;
+  if (!trajectory_is_stale) {
+    // pull_over_manager_node is still actively feeding fresh trajectories -- nothing to hold
+    // for, regardless of what the (possibly momentarily stale/blipping) status topic last said.
+    return;
+  }
+  holding_ = true;
   output_pub_->publish(buildHoldTrajectory(latest_odometry_->pose.pose, now()));
 }
 
