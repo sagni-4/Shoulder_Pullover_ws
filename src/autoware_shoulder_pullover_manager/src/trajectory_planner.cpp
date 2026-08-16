@@ -136,8 +136,12 @@ PullOverTrajectoryPlanner::PullOverTrajectoryPlanner(const TrajectoryPlannerPara
 std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   const KinematicState & start, const PathShape & shape,
   const geometry_msgs::msg::Pose & goal_pose, double duration, const rclcpp::Time & stamp,
-  bool allow_full_stop) const
+  bool allow_full_stop, double departure_speed_floor) const
 {
+  // Negative means "use the configured floor" -- see plan()'s departure_speed_floor docs.
+  const double effective_floor = (departure_speed_floor >= 0.0)
+                                   ? departure_speed_floor
+                                   : params_.min_departure_reference_speed;
   // Terminal acceleration is still hardcoded zero: each individual candidate
   // should settle smoothly by its own end regardless of how it started, and
   // that boundary is never re-examined mid-flight the way the start one is.
@@ -295,11 +299,11 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
         std::min(params_.final_approach_distance, 0.5 * shape.length());
       const double departure_floor =
         remaining_arc_length > effective_final_approach_distance
-          ? params_.min_departure_reference_speed
+          ? effective_floor
           : 0.0;
       floored_speed = is_last ? 0.0 : std::max(speed, departure_floor);
     } else {
-      floored_speed = std::max(speed, params_.min_departure_reference_speed);
+      floored_speed = std::max(speed, effective_floor);
     }
     point.longitudinal_velocity_mps = static_cast<float>(floored_speed);
     point.lateral_velocity_mps = 0.0F;
@@ -484,7 +488,7 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
   const PredictedObjects & objects, const rclcpp::Time & stamp, std::string * failure_reason,
   bool * blocked_by_traffic, const ShapeHint * preferred_hint, ShapeHint * used_hint,
-  double * out_attempted_curvature, bool allow_full_stop) const
+  double * out_attempted_curvature, bool allow_full_stop, double departure_speed_floor) const
 {
   if (blocked_by_traffic) {
     *blocked_by_traffic = false;
@@ -523,7 +527,8 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
                                   const PathShape & shape, double duration,
                                   const std::string & shape_label,
                                   std::string * out_reason) -> std::optional<Trajectory> {
-    auto candidate = buildCandidate(start, shape, goal_pose, duration, stamp, allow_full_stop);
+    auto candidate =
+      buildCandidate(start, shape, goal_pose, duration, stamp, allow_full_stop, departure_speed_floor);
     if (!candidate.has_value()) {
       return std::nullopt;
     }

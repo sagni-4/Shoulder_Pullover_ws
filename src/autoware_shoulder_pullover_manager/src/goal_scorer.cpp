@@ -82,11 +82,62 @@ double GoalScorer::continuityRunLength(const nav_msgs::msg::Path & path, std::si
   return run_length;
 }
 
-double GoalScorer::windowedMinHalfWidth(
+double GoalScorer::requiredForwardProgress(double lateral_offset, double heading_change) const
+{
+  // Guarded against a non-positive curvature cap (a misconfiguration) by falling back to
+  // the flat floor rather than dividing by zero.
+  if (params_.max_maneuver_curvature <= 1e-6) {
+    return params_.min_maneuver_forward_progress;
+  }
+  // Two independent demands on the same path length; the binding one wins. See the two
+  // coefficients' docs for the derivations (lateral: peak curvature of a quintic lateral
+  // shift; heading: integral of a cubic-curvature spiral's own curvature profile).
+  const double lateral_minimum = std::sqrt(
+    params_.lateral_shift_curvature_coefficient * std::abs(lateral_offset) /
+    params_.max_maneuver_curvature);
+  const double heading_minimum = params_.heading_change_curvature_coefficient *
+                                  std::abs(heading_change) / params_.max_maneuver_curvature;
+  // Both are hard kinematic limits; the safety factor turns them into something the vehicle
+  // can actually track with margin to spare -- see forward_progress_safety_factor's docs.
+  const double kinematic_minimum =
+    params_.forward_progress_safety_factor * std::max(lateral_minimum, heading_minimum);
+  return std::max(params_.min_maneuver_forward_progress, kinematic_minimum);
+}
+
+bool GoalScorer::sweptFootprintFits(
+  double lateral_offset, double forward_distance, double half_width) const
+{
+  if (forward_distance <= 1e-3) {
+    return false;
+  }
+  const double d = std::abs(lateral_offset);
+  // Sample the quintic lateral shift and take the worst sideways reach past the shoulder
+  // centerline. y_remaining is how much sideways travel is still owed at u (the vehicle is
+  // still on the lane side by that much), so it credits back the distance not yet closed.
+  // 40 samples is far finer than the metre-scale margins involved here.
+  constexpr int kSamples = 40;
+  double worst_reach = -std::numeric_limits<double>::max();
+  for (int i = 1; i <= kSamples; ++i) {
+    const double u = static_cast<double>(i) / kSamples;
+    const double u2 = u * u;
+    const double u3 = u2 * u;
+    const double u4 = u3 * u;
+    const double u5 = u4 * u;
+    const double progress = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+    const double y_remaining = d * (1.0 - progress);
+    const double theta = std::atan(d / forward_distance * (30.0 * u2 - 60.0 * u3 + 30.0 * u4));
+    const double reach = params_.vehicle_half_width * std::cos(theta) +
+                          params_.vehicle_front_length * std::sin(theta) - y_remaining;
+    worst_reach = std::max(worst_reach, reach);
+  }
+  return worst_reach <= half_width;
+}
+
+double GoalScorer::windowedHalfWidth(
   const nav_msgs::msg::Path & path, const std::vector<float> & half_widths,
   std::size_t index) const
 {
-  double min_width = static_cast<double>(half_widths[index]);
+  std::vector<double> window{static_cast<double>(half_widths[index])};
 
   // Backward half of the window -- same walk/gap rules as smoothedHeading().
   double back_span = 0.0;
@@ -98,7 +149,7 @@ double GoalScorer::windowedMinHalfWidth(
       break;
     }
     back_span += seg_len;
-    min_width = std::min(min_width, static_cast<double>(half_widths[i - 1]));
+    window.push_back(static_cast<double>(half_widths[i - 1]));
   }
 
   // Forward half of the window.
@@ -111,10 +162,16 @@ double GoalScorer::windowedMinHalfWidth(
       break;
     }
     forward_span += seg_len;
-    min_width = std::min(min_width, static_cast<double>(half_widths[i + 1]));
+    window.push_back(static_cast<double>(half_widths[i + 1]));
   }
 
-  return min_width;
+  // Nearest-rank quantile -- see width_window_quantile's docs for why this is not a strict
+  // minimum. Cheap: these windows hold a handful of points.
+  std::sort(window.begin(), window.end());
+  const std::size_t rank = static_cast<std::size_t>(
+    std::clamp(params_.width_window_quantile, 0.0, 1.0) *
+    static_cast<double>(window.size() - 1));
+  return window[rank];
 }
 
 geometry_msgs::msg::Quaternion GoalScorer::smoothedHeading(
@@ -217,9 +274,15 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
     const double to_candidate_y = candidate_position.y - ego_pose.position.y;
     const double forward_alignment =
       to_candidate_x * ego_forward_x + to_candidate_y * ego_forward_y;
+    // Cheap floor first (also rejects anything not meaningfully ahead of ego); the full
+    // lateral+heading requirement is applied below, once this candidate's smoothed heading
+    // -- and therefore the heading change it actually demands -- is known.
     if (forward_alignment < params_.min_maneuver_forward_progress) {
       continue;
     }
+    // Perpendicular component: how far sideways this candidate asks the vehicle to move.
+    const double lateral_offset =
+      std::abs(-ego_forward_y * to_candidate_x + ego_forward_x * to_candidate_y);
 
     const double continuity_length = continuityRunLength(centerline_map, i);
     if (continuity_length < params_.min_continuity_length) {
@@ -234,7 +297,7 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
     double scaled_half_width = 0.0;
     if (have_width_data) {
       scaled_half_width = params_.width_measurement_scale *
-                          windowedMinHalfWidth(centerline_map, half_widths, i);
+                          windowedHalfWidth(centerline_map, half_widths, i);
       if (scaled_half_width < required_half_width) {
         continue;
       }
@@ -259,6 +322,45 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
     // consecutive replanning cycles before giving up).
     auto goal_pose = centerline_map.poses[i].pose;
     goal_pose.orientation = smoothedHeading(centerline_map, i);
+
+    // Pull the goal inboard, toward the side ego is approaching from -- see
+    // goal_inboard_bias's docs for why aiming at the raw centerline lands the vehicle against
+    // the shoulder's far line. The direction is derived per candidate from which side ego is
+    // actually on, taken perpendicular to the goal's own (shoulder-tangent) heading, so it
+    // works for a shoulder on either side without a hand-set left/right flag. Computed at
+    // selection time, while ego is still in the lane and the sign is unambiguous; the goal
+    // pose is fixed from here on, so it cannot flip later as ego crosses over.
+    if (params_.goal_inboard_bias > 0.0) {
+      const double goal_yaw = yawFromQuaternion(goal_pose.orientation);
+      const double normal_x = -std::sin(goal_yaw);
+      const double normal_y = std::cos(goal_yaw);
+      const double ego_side =
+        (ego_pose.position.x - goal_pose.position.x) * normal_x +
+        (ego_pose.position.y - goal_pose.position.y) * normal_y;
+      const double sign = (ego_side >= 0.0) ? 1.0 : -1.0;
+      goal_pose.position.x += sign * params_.goal_inboard_bias * normal_x;
+      goal_pose.position.y += sign * params_.goal_inboard_bias * normal_y;
+    }
+
+    // Full reachability requirement, now that the heading this candidate demands is known:
+    // the path must be long enough to BOTH translate the vehicle sideways onto the shoulder
+    // and rotate it onto the shoulder's tangent (see requiredForwardProgress). Checked
+    // before the spiral solve below, which is far more expensive -- and, unlike the solver,
+    // this states the reason a too-close goal is hopeless rather than discovering it as a
+    // curvature overflow several cycles later.
+    double heading_change = yawFromQuaternion(goal_pose.orientation) - ego_yaw;
+    while (heading_change > M_PI) heading_change -= 2.0 * M_PI;
+    while (heading_change < -M_PI) heading_change += 2.0 * M_PI;
+    if (forward_alignment < requiredForwardProgress(lateral_offset, heading_change)) {
+      continue;
+    }
+    // The vehicle must fit the shoulder for the whole approach, not just at the goal -- see
+    // sweptFootprintFits(). Only meaningful with real width data; when width gating is off
+    // there is nothing to check the sweep against.
+    if (have_width_data && !sweptFootprintFits(lateral_offset, forward_alignment, scaled_half_width)) {
+      continue;
+    }
+
     const CurvatureSpiralPath maneuver(
       ego_pose, goal_pose, params_.max_maneuver_curvature);
     if (!maneuver.valid()) {

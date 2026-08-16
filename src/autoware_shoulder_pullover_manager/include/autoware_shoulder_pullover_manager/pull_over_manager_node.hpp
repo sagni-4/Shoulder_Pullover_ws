@@ -271,12 +271,36 @@ private:
     const geometry_msgs::msg::Pose & ego_pose, double ego_speed, double distance_to_goal,
     double heading_error) const;
 
+  /// Lateral offset from `ego_pose` to the nearest live centerline point, and the (scaled)
+  /// measured half-width there. Returns false, leaving the outputs untouched, when no
+  /// index-aligned width data exists. Shared by the arrival gate and the recorded
+  /// diagnostics so the two can never disagree about the same instant.
+  [[nodiscard]] bool shoulderContainmentAt(
+    const geometry_msgs::msg::Pose & ego_pose, double * lateral_offset,
+    double * half_width) const;
+
   /// latest_shoulder_halfwidth_'s data as a vector iff it is present AND index-aligned
   /// (size-matched) with latest_centerline_ as it stands right now; empty otherwise --
   /// the exact "usable width data" condition both GoalScorer::selectBestGoal (goal gate)
   /// and isConfirmedSafeToStop (arrival gate) need, factored here so the two can never
   /// disagree about whether data exists.
   [[nodiscard]] std::vector<float> usableHalfWidths() const;
+
+  /// Re-scores the live centerline from ego's *current* pose and, if anything is feasible,
+  /// swaps it in as active_goal_ while STAYING in kOperating; returns false (leaving state
+  /// untouched) when nothing is. Used wherever a goal is abandoned mid-maneuver.
+  ///
+  /// Why this exists: dropping to kDecelerating on every abandon was actively harmful once
+  /// ego was already converging onto the shoulder. kDecelerating publishes
+  /// buildCrawlTrajectory(), which by design drives *straight along ego's current heading*
+  /// -- so every abandon threw away the turn in progress and drove the vehicle straight
+  /// ahead at whatever heading it had mid-curve, then re-selected a goal from that worse
+  /// pose. Live-observed 2026-08-16: the vehicle reached the shoulder but ended up parked
+  /// 0.197 rad off its tangent, because the approach was repeatedly interrupted this way
+  /// and never ran to completion. Re-selecting in place keeps a real, goal-directed curved
+  /// trajectory published every cycle, so heading keeps converging across the swap.
+  [[nodiscard]] bool reselectGoalInPlace(
+    const geometry_msgs::msg::Pose & ego_pose, double ego_speed);
 
   /// The actual, unconditional stand-down: resets state_ to kIdle and clears every piece of
   /// in-progress maneuver state (active_goal_, last_trajectory_, override state, etc). Shared
@@ -399,12 +423,33 @@ private:
   /// whether part of the vehicle still overhangs back into the travel lane. Uses
   /// shoulder_centerline_node's measured half-width (see isConfirmedSafeToStop()'s docs) -- not
   /// an assumed constant -- so this reflects the *actual* shoulder at this specific spot.
-  double lateral_safety_margin_{0.3};  ///< m. Extra clearance required beyond the vehicle's own
+  double lateral_safety_margin_{0.15};  ///< m. Extra clearance required beyond the vehicle's own
                                         ///< half-width before the shoulder is considered wide
                                         ///< enough -- absorbs localization/perception error and
                                         ///< leaves a visible, non-hairline gap from the shoulder
                                         ///< edge, similar in spirit to standard parking-assist
                                         ///< clearance margins.
+                                        ///<
+                                        ///< Lowered 0.3 -> 0.15 on 2026-08-16 against live
+                                        ///< measurements. This budget is spent on *centering*,
+                                        ///< not on width: the check requires lateral_offset +
+                                        ///< vehicle_half_width + this <= measured half-width, so
+                                        ///< with the 1.32m median half-width now measured on this
+                                        ///< shoulder and a 0.948m vehicle half-width, 0.3 left
+                                        ///< only 0.07m of allowable offset from the centerline --
+                                        ///< tighter than the stock controller's own tracking
+                                        ///< error, so arrival could never confirm no matter how
+                                        ///< well the vehicle parked. 0.15 leaves 0.22m, which the
+                                        ///< maneuver can actually hit. Real clearance is larger
+                                        ///< than this arithmetic suggests, since the measured
+                                        ///< half-width is itself a conservative view of the
+                                        ///< shoulder (1.32m measured vs 1.75m CARLA ground
+                                        ///< truth -- the mask does not reach the very edge).
+                                        ///< Note goal_width_margin (GoalScorer, 0.3) is a
+                                        ///< separate, deliberately stricter budget: it decides
+                                        ///< whether a stretch is wide enough to aim at in the
+                                        ///< first place, where being conservative costs only a
+                                        ///< candidate, not a completed maneuver.
   /// If true (default) and no measured shoulder-width data is available (topic never received,
   /// or shoulder_centerline_node running in "median" mode, which has no extent to measure --
   /// see lateralHalfWidth()'s docs in that package), containment can never be confirmed and the
@@ -420,6 +465,35 @@ private:
   /// Autoware vehicle_info width formula, not an assumed constant. Used by
   /// isConfirmedSafeToStop()'s containment check.
   double vehicle_half_width_{0.95};
+  /// m. Distance to the active goal below which the maneuver is committed to finishing on it:
+  /// this cycle's trajectory may decelerate to a genuine stop (plan()'s allow_full_stop), and
+  /// the goal is no longer swapped out by reselectGoalInPlace(). Deliberately larger than
+  /// arrival_distance_threshold_ (1.0m) so the vehicle has room to actually decelerate into
+  /// arrival rather than needing to already be there.
+  ///
+  /// Added 2026-08-16 to break two coupled endgame failures seen live (bag
+  /// pullover_final2_1786911450): (a) allow_full_stop was gated on containment measured at
+  /// ego's current pose, which cannot become true while the vehicle is still short of the
+  /// goal and off-center, so speed stayed floored at 2.5 m/s and it could never settle; and
+  /// (b) every re-selection picks a goal at least GoalScorer's min_stopping_distance (~5m)
+  /// ahead, so a re-selection triggered during final approach makes the target recede and the
+  /// vehicle can never close the last metre -- live it stopped 1.11m short of a goal that had
+  /// just moved from y=203.7 to y=208.5.
+  double final_approach_engage_distance_{4.0};
+  /// rad. How straight the vehicle must already be before it is allowed to commit to a real
+  /// stop. Deliberately looser than arrival_heading_threshold_ (0.1) -- the final decel still
+  /// has to finish the last few degrees -- but tight enough to refuse a visibly crooked stop.
+  /// Without it the vehicle could halt mid-turn, which is exactly how it came to rest 0.13
+  /// rad off the shoulder tangent, looking parked at an angle rather than pulled over.
+  double final_approach_heading_tolerance_{0.20};
+  /// m/s. Speed floor used inside final_approach_engage_distance_ instead of the planner's
+  /// min_departure_reference_speed (2.5). That value is an *exposure* limit for crossing the
+  /// travel lane; here the binding concern is *precision*, and 2.5 m/s is too fast for the
+  /// lateral controller to converge heading over the last few metres of a curving entry --
+  /// live-verified as a 7.5 deg residual at rest. 1.0 m/s still clears stock Autoware's
+  /// zero-velocity deadlock epsilons (1e-3 / 1e-2) by two orders of magnitude, so it does not
+  /// reintroduce the STOPPED-state latch this floor originally existed to avoid.
+  double final_approach_reference_speed_{1.0};
   int max_consecutive_planning_failures_{30};
   int max_consecutive_traffic_blocked_cycles_{300};  ///< See consecutive_traffic_blocked_cycles_.
   double deceleration_lookahead_distance_{40.0};  ///< m. How far ahead (along ego's current

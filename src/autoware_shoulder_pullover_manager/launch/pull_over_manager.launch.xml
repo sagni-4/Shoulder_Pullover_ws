@@ -16,11 +16,17 @@
   <arg name="arrival_distance_threshold" default="1.0" description="Meters from goal to declare the maneuver succeeded"/>
   <arg name="arrival_speed_threshold" default="0.2" description="m/s below which ego is considered stopped for arrival purposes"/>
   <arg name="arrival_heading_threshold" default="0.1" description="rad -- ego's heading must also be within this of the goal's before declaring success, in addition to distance+speed, so the vehicle doesn't declare 'arrived' mid-turn (e.g. perpendicular instead of parallel-parked). See pull_over_manager_node.hpp."/>
-  <arg name="lateral_safety_margin" default="0.3" description="m -- extra clearance required beyond the vehicle's own half-width before the shoulder is considered wide enough to confirm containment. See pull_over_manager_node.hpp's isConfirmedSafeToStop docs."/>
+  <arg name="lateral_safety_margin" default="0.15" description="m -- extra clearance required beyond the vehicle's own half-width before the shoulder is considered wide enough to confirm containment. See pull_over_manager_node.hpp's isConfirmedSafeToStop docs."/>
   <arg name="require_shoulder_containment" default="true" description="If true (default), a stop can only be confirmed once the vehicle's measured footprint fits within shoulder_centerline_node's measured shoulder width -- fails closed (keeps crawling) if that width data isn't available. Set false only for environments that intentionally don't run shoulder_centerline_node with width publishing."/>
   <arg name="wheel_tread" default="1.64" description="m -- vehicle_info field, used only to compute vehicle_half_width_ for the containment check (0.5*wheel_tread + max(left_overhang,right_overhang))."/>
   <arg name="left_overhang" default="0.128" description="m -- vehicle_info field, see wheel_tread."/>
   <arg name="right_overhang" default="0.128" description="m -- vehicle_info field, see wheel_tread."/>
+  <arg name="wheel_base" default="2.79" description="m -- vehicle_info field; with front_overhang gives base_link-to-front-bumper for GoalScorer swept-footprint check"/>
+  <arg name="front_overhang" default="1.0" description="m -- vehicle_info field, see wheel_base"/>
+  <arg name="final_approach_engage_distance" default="4.0" description="m -- distance to the goal below which the maneuver commits to finishing on it: the trajectory may decelerate to a real stop, and the goal is no longer re-selected. Larger than arrival_distance_threshold so there is room to decelerate INTO arrival. See pull_over_manager_node.hpp."/>
+  <arg name="final_approach_heading_tolerance" default="0.20" description="rad -- how straight the vehicle must already be before committing to a real stop. Looser than arrival_heading_threshold so the final decel can finish the last few degrees, tight enough to refuse a visibly crooked stop. See pull_over_manager_node.hpp."/>
+  <arg name="final_approach_reference_speed" default="1.0" description="m/s -- speed floor inside final_approach_engage_distance, replacing the 2.5 m/s exposure floor with a precision one: 2.5 is too fast for the lateral controller to converge heading over the last few metres (live-verified 7.5 deg residual at rest). Still 100x above the controller's zero-velocity deadlock epsilons."/>
+  <arg name="goal_inboard_bias" default="0.3" description="m -- shifts each selected goal from the measured shoulder centerline back toward the side ego approaches from, so the vehicle parks nearer the middle instead of hugging the shoulder's far line (where it was observed stalling). Counteracts both an outboard-biased measured centerline and one-directional tracking overshoot. See goal_scorer.hpp."/>
   <arg name="max_consecutive_planning_failures" default="30" description="Consecutive cycles with no feasible/collision-free trajectory before giving up and reporting failure"/>
   <arg name="max_consecutive_traffic_blocked_cycles" default="300" description="Consecutive cycles spent contingency-braking for traffic blocking the planned path before giving up -- deliberately much more generous than max_consecutive_planning_failures, since waiting for another vehicle/pedestrian to clear can reasonably take much longer than a genuinely-infeasible-goal retry loop should"/>
   <arg name="standdown_grace_period" default="90.0" description="s -- how long an OperateMrm(operate=false) received while a maneuver is active must persist, with no intervening operate=true, before it's treated as a genuine stand-down rather than mrm_handler cancelling+re-calling this service in response to a transient upstream availability blip (e.g. an intermittent diagnostic WARN with no hysteresis applied). Deliberately long (worst observed blip live 2026-08-15 was 70.76s) -- see pull_over_manager_node.hpp's standdown_grace_period_ docs for why a long window here is safe, not risky: autoware_vehicle_cmd_gate enforces real vehicle safety directly off mrm_state regardless of this node's internal bookkeeping. Loss of autonomous mode still overrides this immediately, unconditionally -- see autonomous_mode_engaged_ in onPlanningTimer()."/>
@@ -30,11 +36,11 @@
   <arg name="direct_trajectory_output_topic" default="" description="DANGER if misused: when non-empty, this node ALSO publishes its planned trajectory directly on this topic name every planning cycle while operating. Only set this to the live control-facing trajectory topic (e.g. /planning/trajectory) if planning_validator's own output has been remapped away from that name first -- otherwise two publishers race on the same topic while the vehicle may be under autonomous control. Leave empty (default) to only publish on this node's own debug topics."/>
 
   <arg name="max_lookahead_distance" default="60.0"/>
-  <arg name="min_maneuver_forward_progress" default="2.0" description="m -- minimum forward-projected (along ego's current heading) distance a candidate must offer, distinct from straight-line max_lookahead_distance above. Rejects near-degenerate 'almost pure sidestep' goals (large lateral offset, vanishing forward room) whose required curvature is hypersensitive to ego's exact pose -- live-tested root cause 2026-08-10, see goal_scorer.hpp."/>
+  <arg name="min_maneuver_forward_progress" default="2.0" description="m -- FLOOR on the forward-projected (along ego's current heading) distance a candidate must offer, distinct from straight-line max_lookahead_distance above. Rejects near-degenerate 'almost pure sidestep' goals (large lateral offset, vanishing forward room) whose required curvature is hypersensitive to ego's exact pose -- live-tested root cause 2026-08-10, see goal_scorer.hpp."/>
   <arg name="comfortable_deceleration" default="2.0"/>
   <arg name="stopping_margin" default="5.0"/>
   <arg name="max_continuity_gap" default="3.0"/>
-  <arg name="min_continuity_length" default="8.0"/>
+  <arg name="min_continuity_length" default="5.0" description="m -- confirmed shoulder required AHEAD of a candidate. This is a reserve subtracted from the perception horizon, so it caps how far ahead goals can exist: measured live 2026-08-16, 8.0 left only 12.4m usable against a 14.7m physics requirement and starved the search entirely. 5.0 still exceeds the vehicle length (~4.8m). See goal_scorer.hpp."/>
   <arg name="reference_run_length" default="20.0"/>
   <arg name="max_reference_curvature" default="0.3"/>
   <arg name="weight_continuity" default="0.4"/>
@@ -45,8 +51,10 @@
   <arg name="max_maneuver_jerk" default="3.0" description="m/s^3 -- must match trajectory_max_lateral_jerk below"/>
   <arg name="heading_smoothing_distance" default="3.0" description="m -- each-direction window used to average local centerline tangent segments into the goal's terminal heading, instead of trusting one waypoint's own (noisy) orientation field directly -- keeps the final parked heading close to parallel with the shoulder"/>
   <arg name="goal_width_margin" default="0.3" description="m -- extra clearance beyond the vehicle's own half-width the (scaled, windowed-min) measured shoulder half-width must offer before a goal candidate is eligible. Added 2026-08-16: goals used to be selected on measurably-too-narrow shoulder (0.4m half-width vs ~1.25m needed), wedging the vehicle against the shoulder-edge barrier -- see goal_scorer.hpp."/>
-  <arg name="width_measurement_scale" default="1.0" description="Multiplier on the published half-width before gating. 1.0 since 2026-08-16: shoulder_centerline_node now measures half-width directly (back-projecting the mask run's edge pixels via the same ground-plane IPM as the centerline itself), so no correction is needed. Do not set a nonzero correction without evidence the underlying measurement is genuinely proportional to truth -- see goal_scorer.hpp."/>
+  <arg name="width_measurement_scale" default="1.2" description="Multiplier on the published half-width before gating. 1.0 since 2026-08-16: shoulder_centerline_node now measures half-width directly (back-projecting the mask run's edge pixels via the same ground-plane IPM as the centerline itself), so no correction is needed. Do not set a nonzero correction without evidence the underlying measurement is genuinely proportional to truth -- see goal_scorer.hpp."/>
   <arg name="width_window_half_length" default="2.5" description="m -- arclength window (each direction) over which the MINIMUM measured half-width is taken at a candidate; the parked vehicle occupies its own length of shoulder, not one point. ~Half the sample_vehicle's length."/>
+  <arg name="forward_progress_safety_factor" default="1.25" description="Multiplier on the kinematic minimum forward room a goal must offer. The raw minimum is a LIMIT (max steering for the whole maneuver, no tracking margin); 1.5 puts entry at ~44% of the steering cap so the controller can converge heading before the vehicle commits to the shoulder. Live 2026-08-16: without it the vehicle arrived still rotating, settled 11.4deg off tangent, and caught the shoulder edge. See goal_scorer.hpp."/>
+  <arg name="width_window_quantile" default="0.25" description="Quantile of the window's measured half-widths used as its value (0=strict minimum, 0.5=median). Was a strict minimum until 2026-08-16: per-bin dropouts (an isolated 0.01m among 0.4m neighbours) let one bad bin veto every candidate within the window, and once ego was on the shoulder no goal was findable for the whole 40s budget. See goal_scorer.hpp."/>
   <arg name="weight_width" default="0.3" description="Score weight preferring wider measured shoulder beyond the bare gate -- pushes goals toward the deepest part of a pocket rather than its marginal entrance"/>
   <arg name="reference_extra_half_width" default="0.5" description="m -- extra half-width beyond the gate requirement at which the width score term saturates"/>
   <arg name="require_width_data" default="true" description="Fail closed (no goal candidates at all) when no index-aligned measured-width data is available, mirroring require_shoulder_containment on the arrival side"/>
@@ -96,6 +104,12 @@
     <param name="wheel_tread" value="$(var wheel_tread)"/>
     <param name="left_overhang" value="$(var left_overhang)"/>
     <param name="right_overhang" value="$(var right_overhang)"/>
+    <param name="wheel_base" value="$(var wheel_base)"/>
+    <param name="front_overhang" value="$(var front_overhang)"/>
+    <param name="final_approach_engage_distance" value="$(var final_approach_engage_distance)"/>
+    <param name="final_approach_heading_tolerance" value="$(var final_approach_heading_tolerance)"/>
+    <param name="final_approach_reference_speed" value="$(var final_approach_reference_speed)"/>
+    <param name="goal_inboard_bias" value="$(var goal_inboard_bias)"/>
     <param name="max_consecutive_planning_failures" value="$(var max_consecutive_planning_failures)"/>
     <param name="max_consecutive_traffic_blocked_cycles" value="$(var max_consecutive_traffic_blocked_cycles)"/>
     <param name="standdown_grace_period" value="$(var standdown_grace_period)"/>
@@ -120,6 +134,8 @@
     <param name="goal_width_margin" value="$(var goal_width_margin)"/>
     <param name="width_measurement_scale" value="$(var width_measurement_scale)"/>
     <param name="width_window_half_length" value="$(var width_window_half_length)"/>
+    <param name="width_window_quantile" value="$(var width_window_quantile)"/>
+    <param name="forward_progress_safety_factor" value="$(var forward_progress_safety_factor)"/>
     <param name="weight_width" value="$(var weight_width)"/>
     <param name="reference_extra_half_width" value="$(var reference_extra_half_width)"/>
     <param name="require_width_data" value="$(var require_width_data)"/>

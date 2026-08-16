@@ -91,6 +91,13 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     "width_measurement_scale", scorer_params_.width_measurement_scale);
   scorer_params_.width_window_half_length = declare_parameter<double>(
     "width_window_half_length", scorer_params_.width_window_half_length);
+  scorer_params_.width_window_quantile = declare_parameter<double>(
+    "width_window_quantile", scorer_params_.width_window_quantile);
+  scorer_params_.heading_change_curvature_coefficient = declare_parameter<double>(
+    "heading_change_curvature_coefficient",
+    scorer_params_.heading_change_curvature_coefficient);
+  scorer_params_.forward_progress_safety_factor = declare_parameter<double>(
+    "forward_progress_safety_factor", scorer_params_.forward_progress_safety_factor);
   scorer_params_.weight_width =
     declare_parameter<double>("weight_width", scorer_params_.weight_width);
   scorer_params_.reference_extra_half_width = declare_parameter<double>(
@@ -161,7 +168,20 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     const double left_overhang = declare_parameter<double>("left_overhang", 0.128);
     const double right_overhang = declare_parameter<double>("right_overhang", 0.128);
     vehicle_half_width_ = 0.5 * wheel_tread + std::max(left_overhang, right_overhang);
+    // base_link -> front bumper, for GoalScorer's swept-footprint check. Same vehicle_info
+    // fields every other node in this launch receives.
+    const double wheel_base = declare_parameter<double>("wheel_base", 2.79);
+    const double front_overhang = declare_parameter<double>("front_overhang", 1.0);
+    scorer_params_.vehicle_front_length = wheel_base + front_overhang;
   }
+  final_approach_engage_distance_ = declare_parameter<double>(
+    "final_approach_engage_distance", final_approach_engage_distance_);
+  final_approach_heading_tolerance_ = declare_parameter<double>(
+    "final_approach_heading_tolerance", final_approach_heading_tolerance_);
+  final_approach_reference_speed_ = declare_parameter<double>(
+    "final_approach_reference_speed", final_approach_reference_speed_);
+  scorer_params_.goal_inboard_bias =
+    declare_parameter<double>("goal_inboard_bias", scorer_params_.goal_inboard_bias);
   max_consecutive_planning_failures_ =
     declare_parameter<int>("max_consecutive_planning_failures", 30);
   max_consecutive_traffic_blocked_cycles_ =
@@ -475,6 +495,47 @@ void PullOverManagerNode::onOperateMrm(
   response->response.message = message;
 }
 
+bool PullOverManagerNode::reselectGoalInPlace(
+  const geometry_msgs::msg::Pose & ego_pose, double ego_speed)
+{
+  if (!latest_centerline_ || latest_centerline_->poses.empty()) {
+    return false;
+  }
+  // Never swap the goal during final approach -- see final_approach_engage_distance_'s docs.
+  // Every candidate GoalScorer can return is at least min_stopping_distance (~5m) ahead, so
+  // re-selecting here would move the target further away than it currently is and the vehicle
+  // could never close the last metre.
+  if (active_goal_.has_value()) {
+    const double distance_to_active_goal = std::hypot(
+      active_goal_->position.x - ego_pose.position.x,
+      active_goal_->position.y - ego_pose.position.y);
+    if (distance_to_active_goal <= final_approach_engage_distance_) {
+      return false;
+    }
+  }
+  const auto goal =
+    goal_scorer_->selectBestGoal(*latest_centerline_, ego_pose, ego_speed, usableHalfWidths());
+  if (!goal.has_value()) {
+    return false;
+  }
+  RCLCPP_INFO(
+    get_logger(),
+    "Re-selected shoulder goal in place at (%.2f, %.2f) without leaving the maneuver "
+    "(score=%.3f distance=%.1fm maneuver_curvature=%.4f measured_half_width=%.2fm) -- the "
+    "approach keeps converging instead of restarting from a straight-ahead crawl.",
+    goal->pose.position.x, goal->pose.position.y, goal->score, goal->distance_from_ego,
+    goal->maneuver_curvature, goal->measured_half_width);
+  active_goal_ = goal->pose;
+  active_goal_shape_hint_.reset();  // Fresh geometry -- last cycle's shape no longer applies.
+  contingency_stop_goal_.reset();
+  contingency_stop_goal_shape_hint_.reset();
+  consecutive_planning_failures_ = 0;
+  last_attempted_curvature_ = 0.0;
+  consecutive_curvature_increases_ = 0;
+  consecutive_traffic_blocked_cycles_ = 0;
+  return true;
+}
+
 void PullOverManagerNode::performStandDown(const std::string & reason)
 {
   RCLCPP_INFO(get_logger(), "%s -- standing down.", reason.c_str());
@@ -707,6 +768,44 @@ std::vector<float> PullOverManagerNode::usableHalfWidths() const
   return latest_shoulder_halfwidth_->data;
 }
 
+bool PullOverManagerNode::shoulderContainmentAt(
+  const geometry_msgs::msg::Pose & ego_pose, double * lateral_offset, double * half_width) const
+{
+  if (!latest_centerline_ || latest_centerline_->poses.empty()) {
+    return false;
+  }
+  if (
+    !latest_shoulder_halfwidth_ ||
+    latest_shoulder_halfwidth_->data.size() != latest_centerline_->poses.size()) {
+    return false;
+  }
+  std::size_t nearest_index = 0;
+  double nearest_dist_sq = std::numeric_limits<double>::max();
+  for (std::size_t i = 0; i < latest_centerline_->poses.size(); ++i) {
+    const auto & p = latest_centerline_->poses[i].pose.position;
+    const double dx = p.x - ego_pose.position.x;
+    const double dy = p.y - ego_pose.position.y;
+    const double dist_sq = dx * dx + dy * dy;
+    if (dist_sq < nearest_dist_sq) {
+      nearest_dist_sq = dist_sq;
+      nearest_index = i;
+    }
+  }
+  const auto & nearest_point = latest_centerline_->poses[nearest_index].pose.position;
+  const double ego_yaw = yawFromQuaternionLocal(ego_pose.orientation);
+  const double to_point_x = nearest_point.x - ego_pose.position.x;
+  const double to_point_y = nearest_point.y - ego_pose.position.y;
+  if (lateral_offset) {
+    *lateral_offset =
+      std::abs(-std::sin(ego_yaw) * to_point_x + std::cos(ego_yaw) * to_point_y);
+  }
+  if (half_width) {
+    *half_width = scorer_params_.width_measurement_scale *
+                  static_cast<double>(latest_shoulder_halfwidth_->data[nearest_index]);
+  }
+  return true;
+}
+
 bool PullOverManagerNode::isConfirmedSafeToStop(
   const geometry_msgs::msg::Pose & ego_pose, double ego_speed, double distance_to_goal,
   double heading_error) const
@@ -720,53 +819,13 @@ bool PullOverManagerNode::isConfirmedSafeToStop(
   if (std::abs(heading_error) > arrival_heading_threshold_) {
     return false;
   }
-
-  if (!latest_centerline_ || latest_centerline_->poses.empty()) {
+  double lateral_offset = 0.0;
+  double half_width = 0.0;
+  if (!shoulderContainmentAt(ego_pose, &lateral_offset, &half_width)) {
+    // No usable measured width for the centerline as it stands right now -- can't confirm
+    // containment this cycle. Fails closed unless explicitly disabled.
     return !require_shoulder_containment_;
   }
-  if (
-    !latest_shoulder_halfwidth_ ||
-    latest_shoulder_halfwidth_->data.size() != latest_centerline_->poses.size()) {
-    // Genuinely no measured width for the centerline as it stands right now (topic never
-    // arrived, or arrived once but is momentarily out of step with a just-updated centerline --
-    // see latest_shoulder_halfwidth_'s docs) -- can't confirm containment this cycle.
-    return !require_shoulder_containment_;
-  }
-
-  // Nearest live centerline point to ego's *current* position (not to active_goal_, which can
-  // be stale by now) -- gives the width measurement that's actually relevant to where the
-  // vehicle really is.
-  std::size_t nearest_index = 0;
-  double nearest_dist_sq = std::numeric_limits<double>::max();
-  for (std::size_t i = 0; i < latest_centerline_->poses.size(); ++i) {
-    const auto & p = latest_centerline_->poses[i].pose.position;
-    const double dx = p.x - ego_pose.position.x;
-    const double dy = p.y - ego_pose.position.y;
-    const double dist_sq = dx * dx + dy * dy;
-    if (dist_sq < nearest_dist_sq) {
-      nearest_dist_sq = dist_sq;
-      nearest_index = i;
-    }
-  }
-
-  // Lateral (perpendicular-to-ego-heading) offset from ego to that nearest centerline point.
-  // Heading has already been confirmed aligned with the shoulder direction above, so ego's own
-  // heading is a valid stand-in for the local shoulder tangent here -- no need to separately
-  // recompute a smoothed centerline tangent.
-  const auto & nearest_point = latest_centerline_->poses[nearest_index].pose.position;
-  const double ego_yaw = yawFromQuaternionLocal(ego_pose.orientation);
-  const double to_point_x = nearest_point.x - ego_pose.position.x;
-  const double to_point_y = nearest_point.y - ego_pose.position.y;
-  const double lateral_offset =
-    std::abs(-std::sin(ego_yaw) * to_point_x + std::cos(ego_yaw) * to_point_y);
-
-  // Same scale the goal-side width gate applies (identity by default, see
-  // goal_scorer.hpp's width_measurement_scale docs) -- routed through the same parameter
-  // so goal selection and arrival confirmation can never judge the same physical spot by
-  // different yardsticks.
-  const double half_width =
-    scorer_params_.width_measurement_scale *
-    static_cast<double>(latest_shoulder_halfwidth_->data[nearest_index]);
   const double required_half_width = lateral_offset + vehicle_half_width_ + lateral_safety_margin_;
   return required_half_width <= half_width;
 }
@@ -940,15 +999,63 @@ void PullOverManagerNode::onPlanningTimer()
   while (heading_error > M_PI) heading_error -= 2.0 * M_PI;
   while (heading_error < -M_PI) heading_error += 2.0 * M_PI;
 
-  // See isConfirmedSafeToStop()'s docs -- this is the single decision point for both (a)
-  // whether this cycle's plan() call below is even allowed to command a real stop, and (b)
-  // whether kSucceeded can fire once ego is also actually slow enough. Splitting those two
-  // (position/heading/containment confirmed vs. actually-at-rest) rather than one combined
-  // check is deliberate: (a) has to be evaluated and acted on *before* ego is slow, so the
-  // final decel-to-stop trajectory itself is what brings speed down, matching how a real
-  // parking maneuver works.
+  // Strict, ego-pose-based confirmation that the vehicle is genuinely parked correctly --
+  // the gate for declaring success. See isConfirmedSafeToStop()'s docs.
   const bool confirmed_safe_to_stop =
     isConfirmedSafeToStop(ego_pose, ego_speed, distance_to_goal, heading_error);
+
+  // Clearance to *decelerate toward* the goal -- a strictly weaker question than "are we
+  // parked correctly", and it must not be conflated with it.
+  //
+  // Live-verified deadlock this breaks, 2026-08-16: allow_full_stop used to be
+  // confirmed_safe_to_stop, whose containment term is evaluated at ego's *current* pose. On
+  // final approach ego is still ~1m short and ~0.4m off the centerline, so containment fails,
+  // so no cycle is allowed to command a stop, so every published sample stays floored at
+  // min_departure_reference_speed (2.5 m/s) -- at which speed the vehicle cannot settle onto
+  // the goal, so it never centers, so containment never becomes true. Bag
+  // pullover_final2_1786911450: the vehicle reached the shoulder with a good heading (3.69
+  // deg, passing) and simply could not finish, leaving MRM stuck in MRM_OPERATING (its
+  // MRM_SUCCEEDED needs operation mode STOP, which this node only requests on kSucceeded)
+  // and the ADAPI motion state stuck at MOVING for the same reason.
+  //
+  // Deciding this from distance-to-goal is sound rather than a loosening: the goal is not an
+  // arbitrary point. GoalScorer only emits goals sitting on the measured centerline that
+  // already passed the footprint-width gate, oriented along the shoulder's own tangent, and
+  // every PathShape terminates at exactly that pose -- so committing to decelerate onto a
+  // validated goal IS the maneuver. The SAE J3016 concern behind the floor (do not linger
+  // stopped while still exposed in a travel lane) is satisfied by the *goal* being off-lane,
+  // not by ego already being centered on it. Declaring success stays strictly gated by
+  // confirmed_safe_to_stop.
+  // Committing to a stop also requires the vehicle to have substantially finished turning.
+  // Stopping mid-turn is what makes the parked pose look skewed and unnatural, and it is how
+  // the vehicle previously came to rest 0.13 rad off the tangent. The tolerance is looser
+  // than arrival_heading_threshold_ so the final decel itself still has room to finish the
+  // last few degrees -- this gate only rejects a *visibly* crooked stop.
+  const bool cleared_to_decelerate_to_stop =
+    distance_to_goal <= final_approach_engage_distance_ &&
+    std::abs(heading_error) <= final_approach_heading_tolerance_;
+
+  // Precision beats exposure once we are this close and off the travel lane -- see plan()'s
+  // departure_speed_floor docs. Applied over the whole final-approach window (not only once
+  // committed) so speed is already low while the last of the heading converges.
+  const double departure_speed_floor = (distance_to_goal <= final_approach_engage_distance_)
+                                          ? final_approach_reference_speed_
+                                          : -1.0;
+
+  // Endgame visibility: without this the only observable is "no arrival", with each of the
+  // four criteria individually invisible -- which cost several full test cycles of guessing.
+  if (distance_to_goal <= final_approach_engage_distance_) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Final approach: distance=%.2fm (<=%.2f? %s) |heading_error|=%.3frad (<=%.3f? %s) "
+      "speed=%.2fm/s (<=%.2f? %s) containment=%s",
+      distance_to_goal, arrival_distance_threshold_,
+      distance_to_goal <= arrival_distance_threshold_ ? "yes" : "NO", std::abs(heading_error),
+      arrival_heading_threshold_,
+      std::abs(heading_error) <= arrival_heading_threshold_ ? "yes" : "NO", ego_speed,
+      arrival_speed_threshold_, ego_speed <= arrival_speed_threshold_ ? "yes" : "NO",
+      confirmed_safe_to_stop ? "yes" : "NO");
+  }
 
   if (confirmed_safe_to_stop && ego_speed <= arrival_speed_threshold_) {
     RCLCPP_INFO(
@@ -991,12 +1098,61 @@ void PullOverManagerNode::onPlanningTimer()
   // min_maneuver_forward_progress: a real near-singular sidestep has large residual lateral
   // offset (small forward_progress, *large* distance_to_goal); normal final-approach
   // convergence has both shrink together. Only the former should abandon.
+  {
+    const double ego_yaw = yawFromQuaternionLocal(ego_pose.orientation);
+    const double to_goal_x = active_goal_->position.x - ego_pose.position.x;
+    const double to_goal_y = active_goal_->position.y - ego_pose.position.y;
+    const double forward_progress =
+      to_goal_x * std::cos(ego_yaw) + to_goal_y * std::sin(ego_yaw);
+    // A goal that is now BEHIND ego is unreachable outright -- this planner only generates
+    // forward paths -- so it must be abandoned regardless of how near it still is. Checked
+    // before (and outside) the distance guard below, which exists to protect a genuine final
+    // approach and would otherwise suppress this: live-verified 2026-08-16, ego overshot a
+    // goal by 1.19m, and because that is inside min_maneuver_forward_progress the abandon
+    // never fired, so the planner reported "no damped step improves the residual" for the
+    // full 30-cycle budget and the whole maneuver failed instead of simply re-selecting a
+    // goal further along the shoulder (which the same session showed works well).
+    if (forward_progress < 0.0) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Ego has passed the active goal (now %.2fm behind) -- unreachable by a forward-only "
+        "planner. Abandoning it rather than retrying a goal we can never reach.",
+        -forward_progress);
+      if (reselectGoalInPlace(ego_pose, ego_speed)) {
+        return;
+      }
+      active_goal_.reset();
+      active_goal_shape_hint_.reset();
+      contingency_stop_goal_.reset();
+      contingency_stop_goal_shape_hint_.reset();
+      consecutive_planning_failures_ = 0;
+      last_attempted_curvature_ = 0.0;
+      consecutive_curvature_increases_ = 0;
+      consecutive_traffic_blocked_cycles_ = 0;
+      state_ = ManagerState::kDecelerating;
+      decelerating_since_ = now();
+      return;
+    }
+  }
+
   if (distance_to_goal > scorer_params_.min_maneuver_forward_progress) {
     const double ego_yaw = yawFromQuaternionLocal(ego_pose.orientation);
     const double to_goal_x = active_goal_->position.x - ego_pose.position.x;
     const double to_goal_y = active_goal_->position.y - ego_pose.position.y;
     const double forward_progress =
       to_goal_x * std::cos(ego_yaw) + to_goal_y * std::sin(ego_yaw);
+    // Deliberately the FLAT floor here, not GoalScorer::requiredForwardProgress() -- that
+    // relation is only valid from a standing start. It comes from a quintic with zero
+    // lateral slope at both ends (y'(0)=0), which describes ego at *selection* time,
+    // tracking straight down its lane with no heading yet committed toward the shoulder.
+    // Mid-maneuver ego is already turning, so a large part of the lateral shift is being
+    // delivered by heading it already has and the from-scratch requirement badly overstates
+    // the room still needed. Tried live 2026-08-16 and reverted the same session: applying
+    // it here abandoned healthy goals on margins of centimetres ("forward room has collapsed
+    // to 11.90m (below the 11.93m ... requires)") on the very cycle after selection, three
+    // times in a row, until the search timed out. This check exists only to catch a goal
+    // degenerating into a pure sidestep as ego overshoots past it, which the flat floor
+    // detects correctly.
     if (forward_progress < scorer_params_.min_maneuver_forward_progress) {
       RCLCPP_WARN(
         get_logger(),
@@ -1004,6 +1160,12 @@ void PullOverManagerNode::onPlanningTimer()
         "advanced -- this goal is now a near-singular sidestep, not a temporary planning "
         "failure. Abandoning it and returning to search.",
         forward_progress, scorer_params_.min_maneuver_forward_progress);
+      // Prefer swapping in a fresh goal without leaving the maneuver -- see
+      // reselectGoalInPlace()'s docs for why falling back to kDecelerating's straight-ahead
+      // crawl costs the heading convergence already achieved.
+      if (reselectGoalInPlace(ego_pose, ego_speed)) {
+        return;
+      }
       active_goal_.reset();
       active_goal_shape_hint_.reset();
       contingency_stop_goal_.reset();
@@ -1028,14 +1190,15 @@ void PullOverManagerNode::onPlanningTimer()
   bool blocked_by_traffic = false;
   PullOverTrajectoryPlanner::ShapeHint used_hint;
   double attempted_curvature = 0.0;
-  // allow_full_stop=confirmed_safe_to_stop -- see plan()'s docs and isConfirmedSafeToStop()'s:
-  // only once position, heading, AND shoulder containment are all independently confirmed does
-  // this cycle's candidate get to command a genuine decel-to-a-stop; otherwise every sample,
-  // including its terminal one, stays floored at min_departure_reference_speed.
+  // allow_full_stop=cleared_to_decelerate_to_stop -- see that flag's docs: once ego is within
+  // final_approach_engage_distance_ of an already-validated goal, this cycle's candidate may
+  // decelerate onto it for real; farther out every sample, including the terminal one, stays
+  // floored at min_departure_reference_speed. Success itself remains gated on the strict,
+  // ego-pose-based confirmed_safe_to_stop.
   const auto trajectory = trajectory_planner_->plan(
     start, *active_goal_, latest_objects_, plan_stamp, &failure_reason, &blocked_by_traffic,
     active_goal_shape_hint_ ? &*active_goal_shape_hint_ : nullptr, &used_hint,
-    &attempted_curvature, confirmed_safe_to_stop);
+    &attempted_curvature, cleared_to_decelerate_to_stop, departure_speed_floor);
 
   if (trajectory.has_value()) {
     active_goal_shape_hint_ = used_hint;
@@ -1168,6 +1331,11 @@ void PullOverManagerNode::onPlanningTimer()
       "search instead of grinding through the full %d-cycle give-up budget.",
       consecutive_curvature_increases_, attempted_curvature, curvature_early_warning_threshold,
       trajectory_params_.max_curvature, max_consecutive_planning_failures_);
+    // Same preference as the forward-room branch above: keep the maneuver alive with a
+    // freshly-scored goal rather than restarting from a straight-ahead crawl.
+    if (reselectGoalInPlace(ego_pose, ego_speed)) {
+      return;
+    }
     active_goal_.reset();
     active_goal_shape_hint_.reset();
     contingency_stop_goal_.reset();

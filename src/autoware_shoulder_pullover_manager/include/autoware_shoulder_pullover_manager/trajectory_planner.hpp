@@ -401,12 +401,23 @@ public:
   /// minimal risk condition guidance (examples given are explicitly "stopped outside active
   /// lanes", not stopped within them) and the general collision-risk literature on vehicles
   /// stopped at very low speed while still exposed to moving traffic.
+  /// `departure_speed_floor` overrides `params_.min_departure_reference_speed` for this call
+  /// when >= 0. It exists because that floor serves two different purposes at two different
+  /// phases and they want different values: crossing the travel lane it is an *exposure*
+  /// limit (do not dawdle where traffic is), but on final approach it becomes a *precision*
+  /// limit -- at 2.5 m/s the lateral controller cannot converge heading over the last few
+  /// metres of a curving entry, which live-verified 2026-08-16 left the vehicle parked
+  /// 0.13 rad (7.5 deg) off the shoulder tangent, just outside the arrival gate, with a
+  /// visibly unnatural skewed stop. A lower floor near the goal buys tracking accuracy while
+  /// still clearing stock Autoware's zero-velocity deadlock epsilons (vel_epsilon=1e-3,
+  /// stopped_state_entry_vel=0.01) by two orders of magnitude.
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> plan(
     const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
     const autoware_perception_msgs::msg::PredictedObjects & objects, const rclcpp::Time & stamp,
     std::string * failure_reason = nullptr, bool * blocked_by_traffic = nullptr,
     const ShapeHint * preferred_hint = nullptr, ShapeHint * used_hint = nullptr,
-    double * out_attempted_curvature = nullptr, bool allow_full_stop = false) const;
+    double * out_attempted_curvature = nullptr, bool allow_full_stop = false,
+    double departure_speed_floor = -1.0) const;
 
 private:
   /// Coefficients of a scalar quintic q(t) = c0 + c1 t + c2 t^2 + c3 t^3 +
@@ -433,7 +444,7 @@ private:
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> buildCandidate(
     const KinematicState & start, const PathShape & shape,
     const geometry_msgs::msg::Pose & goal_pose, double duration, const rclcpp::Time & stamp,
-    bool allow_full_stop) const;
+    bool allow_full_stop, double departure_speed_floor) const;
 
   [[nodiscard]] bool satisfiesKinematicConstraints(
     const autoware_planning_msgs::msg::Trajectory & trajectory,
