@@ -4,9 +4,39 @@
   ros__parameters:
     update_rate: 10
     timeout_operation_mode_availability: 0.5
-    timeout_call_mrm_behavior: 0.01
-    timeout_cancel_mrm_behavior: 0.01
-    use_emergency_holding: false
+    # Stock default (0.01s) is unrealistically tight for this project's CARLA setup: a
+    # /system/mrm/pull_over_manager/operate service round-trip to a node also doing its own
+    # 10Hz trajectory replanning, competing with CARLA/perception/etc. for CPU, routinely exceeds
+    # 10ms under normal (non-broken) conditions. mrm_handler::requestMrmBehavior() treats any
+    # timeout as a hard failure (handleFailedRequest() -> forces behavior=EMERGENCY_STOP, then
+    # re-evaluates and calls PULL_OVER again next cycle) with no distinction from a genuine
+    # failure -- live-verified 2026-08-14: this produced a continuous operate=false/operate=true
+    # cycle roughly every 2-4s, visible both as mrm_state.behavior flickering
+    # PULL_OVER<->EMERGENCY_STOP in RViz and as pull_over_manager restarting its maneuver from a
+    # freshly re-selected goal before the previous attempt could ever finish converging to a
+    # parked heading. 0.3s matches the order of magnitude already used for
+    # timeout_operation_mode_availability above (and the CARLA-specific timeout increases already
+    # applied to localization units in autoware-carla.yaml) while staying well under it, so a
+    # genuinely failed call still escalates within a fraction of a second.
+    timeout_call_mrm_behavior: 0.3
+    timeout_cancel_mrm_behavior: 0.3
+    # {OVERRIDE} Required for a *completed* pull-over to be reportable as such. With this
+    # false, is_emergency_holding_ can never latch (onOperationModeAvailability() returns
+    # early via skip_emergency_holding_check), so isEmergency() reduces to
+    # !isAvailableCurrentOperationMode(). updateMrmState() evaluates isEmergency() FIRST and
+    # returns to NORMAL before running its state machine -- so the instant the pull-over
+    # succeeds and operation mode moves to STOP (which is an available mode), the emergency
+    # clears and MRM jumps MRM_OPERATING -> NORMAL/NONE, skipping MRM_SUCCEEDED entirely.
+    # That is a catch-22 specific to PULL_OVER, whose MRM_SUCCEEDED branch is gated on
+    # isArrivedAtGoal() == (operation mode == STOP): the very transition needed to succeed is
+    # what suppresses the success. Live-verified 2026-08-16: a fully correct pull-over
+    # (stopped 0.39m from goal, 0.006 rad off the shoulder tangent, containment confirmed)
+    # showed mode->STOP at t+0.27s and mrm_state->NORMAL/NONE at t+0.52s, never SUCCEEDED.
+    # True latches the emergency after timeout_emergency_recovery, so isEmergency() stays
+    # true, the state machine runs, and the maneuver is reported as MRM_SUCCEEDED with
+    # behavior PULL_OVER -- which is also the semantically correct outcome: a completed MRM
+    # should hold the vehicle stopped pending operator intervention, not silently self-clear.
+    use_emergency_holding: true
     timeout_emergency_recovery: 5.0
     use_parking_after_stopped: false
     use_pull_over: true

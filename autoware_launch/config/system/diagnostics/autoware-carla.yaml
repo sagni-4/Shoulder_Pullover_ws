@@ -109,11 +109,27 @@ units:
     name: state
     timeout: 3.0
 
+  # hysteresis added for CARLA: live-verified 2026-08-14 via recorded /diagnostics_graph/status
+  # correlated with /system/operation_mode/availability -- during the shoulder pull-over
+  # maneuver's tight, low-speed curves, ndt_scan_matcher genuinely and repeatedly hits its
+  # iteration cap ("possibility of oscillation in a local minimum"), each blip lasting well
+  # under 1s before recovering to OK on its own. Without hysteresis, every blip propagates
+  # instantly through this AND-gated leaf -> /autoware/localization -> /autoware/modes/pull_over,
+  # flipping operation_mode_availability_->pull_over false for a fraction of a second at a time --
+  # which is enough for mrm_handler's getCurrentMrmBehavior() to re-evaluate away from PULL_OVER
+  # and back, cancelling and re-calling the pull_over_manager's operate service on every blip
+  # (observed live: PULL_OVER<->EMERGENCY_STOP flicker in RViz, MRM state OPERATING<->SUCCEEDED
+  # flicker, and the maneuver restarting from a freshly re-selected goal before it could converge
+  # to a parked heading). 1.0s comfortably exceeds every observed blip duration (~0.3-0.65s) while
+  # still reacting to a genuinely sustained localization failure well within a human-relevant
+  # timeframe. Only added to this specific leaf, not blanket across localization -- accuracy and
+  # sensor_fusion_status stayed OK throughout the same live capture, so they don't need it.
   - path: /autoware/localization/scan_matching_status
     type: diag
     node: ndt_scan_matcher
     name: scan_matching_status
     timeout: 3.0
+    hysteresis: 1.0
 
   - path: /autoware/localization/accuracy
     type: diag

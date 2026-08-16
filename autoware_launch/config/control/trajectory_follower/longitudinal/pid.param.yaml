@@ -19,7 +19,7 @@
     enable_overshoot_emergency: false # {OVERRIDE}
     enable_large_tracking_error_emergency: true
     enable_slope_compensation: true
-    enable_keep_stopped_until_steer_convergence: true
+    enable_keep_stopped_until_steer_convergence: false # {OVERRIDE: live-verified 2026-08-13 -- this gate additionally requires MPC's is_steer_converged, which needs >=1s of steering history that a genuinely motionless (v=0) vehicle may never accumulate, latching STOPPED indefinitely even with a continuously-republished nonzero departure trajectory; sim-only relaxation for the shoulder-pullover project's low-speed v0=0 departures, not evaluated for sim-to-real}
 
     # state transition
     drive_state_stop_dist: 0.5
