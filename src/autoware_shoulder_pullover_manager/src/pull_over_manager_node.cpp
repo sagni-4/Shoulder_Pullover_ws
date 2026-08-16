@@ -119,6 +119,8 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     "trajectory_min_departure_reference_speed", trajectory_params_.min_departure_reference_speed);
   trajectory_params_.final_approach_distance = declare_parameter<double>(
     "trajectory_final_approach_distance", trajectory_params_.final_approach_distance);
+  trajectory_params_.final_approach_decel = declare_parameter<double>(
+    "trajectory_final_approach_decel", trajectory_params_.final_approach_decel);
   trajectory_params_.max_speed =
     declare_parameter<double>("trajectory_max_speed", trajectory_params_.max_speed);
   trajectory_params_.min_path_turn_radius = declare_parameter<double>(

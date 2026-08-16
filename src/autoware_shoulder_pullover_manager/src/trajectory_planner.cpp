@@ -294,13 +294,26 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
     const double speed = std::max(0.0, qs.velocity(t));
     double floored_speed;
     if (allow_full_stop) {
-      const double remaining_arc_length = shape.length() - s;
-      const double effective_final_approach_distance =
-        std::min(params_.final_approach_distance, 0.5 * shape.length());
-      const double departure_floor =
-        remaining_arc_length > effective_final_approach_distance
-          ? effective_floor
-          : 0.0;
+      // Continuous stopping envelope, NOT a step. The floor decays as the kinematic limit on
+      // still being able to stop at the goal from here -- v = sqrt(2*a*remaining) -- capped
+      // by the nominal floor, so it equals that floor while far out and reaches exactly 0
+      // only AT the goal.
+      //
+      // This replaces a hard switch (floor outside final_approach_distance, 0 inside) that
+      // put a genuine discontinuity into the published speed profile. Live-verified cause of
+      // the stop-and-go seen just after the vehicle entered the shoulder (bag
+      // pullover_final_verify_1786920092): the commanded reference jumped from 1.0 m/s to
+      // ~0 the instant remaining arc length crossed final_approach_distance (2.0m), the
+      // longitudinal controller braked hard to honour it, and the vehicle halted at 1.99m --
+      // short of the goal, so the <=1.0m arrival test failed, so it sat there until the
+      // stuck-override kicked the controller back into DRIVE and it lurched off again. Two
+      // such cycles occurred before the maneuver completed, each ~4.5s of stopped-then-moving.
+      // Removing the step the controller was reacting to makes the approach one continuous
+      // deceleration into the goal.
+      const double remaining_arc_length = std::max(0.0, shape.length() - s);
+      const double stopping_envelope =
+        std::sqrt(2.0 * params_.final_approach_decel * remaining_arc_length);
+      const double departure_floor = std::min(effective_floor, stopping_envelope);
       floored_speed = is_last ? 0.0 : std::max(speed, departure_floor);
     } else {
       floored_speed = std::max(speed, effective_floor);

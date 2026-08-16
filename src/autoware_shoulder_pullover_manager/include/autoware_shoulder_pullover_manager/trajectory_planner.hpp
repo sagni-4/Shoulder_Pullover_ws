@@ -81,6 +81,9 @@ struct TrajectoryPlannerParams
                                                ///< *confirmed* safe to fully stop at can never
                                                ///< coast down to 0 no matter how close it is.
 
+  /// SUPERSEDED 2026-08-16 by final_approach_decel's continuous stopping envelope, which
+  /// removed the speed step this distance used to define. Retained only for config-file
+  /// compatibility; buildCandidate no longer reads it.
   double final_approach_distance{2.0};  ///< m. Once a candidate is built with allow_full_stop
                                          ///< true (see plan()'s docs), the remaining arc length
                                          ///< below which min_departure_reference_speed's floor
@@ -103,6 +106,20 @@ struct TrajectoryPlannerParams
                                          ///< typical 1.0m in PullOverManagerNode, so the
                                          ///< arrival check always evaluates speed *after* this
                                          ///< zone's genuine decel has had room to act.
+  /// m/s^2. Deceleration rate defining the *continuous* stopping envelope applied to the
+  /// published speed floor once a candidate is allowed to stop (see buildCandidate):
+  /// floor(remaining) = min(nominal_floor, sqrt(2 * this * remaining)). Gentle by design --
+  /// this shapes how the approach feels, not how hard the vehicle can brake, and the
+  /// trajectory's own quintic may still command more deceleration than this if it needs to.
+  ///
+  /// Introduced 2026-08-16 to fix a live stop-and-go: the floor used to switch from its
+  /// nominal value straight to 0 at final_approach_distance, a step the longitudinal
+  /// controller answered by braking to a halt ~2m short of the goal, which then failed the
+  /// arrival test and needed the stuck-override to get moving again. 0.3 m/s^2 puts the
+  /// envelope below the 1.0 m/s final-approach floor only inside ~1.7m of the goal, so the
+  /// profile is continuous everywhere and the vehicle glides to rest instead of lurching.
+  double final_approach_decel{0.3};
+
   double max_speed{3.0};  ///< m/s. Hard ceiling on every sample's *published* speed, checked
                            ///< unconditionally in satisfiesKinematicConstraints() (unlike the
                            ///< curvature/lateral checks below, this is never speed-gated -- it
