@@ -135,7 +135,8 @@ PullOverTrajectoryPlanner::PullOverTrajectoryPlanner(const TrajectoryPlannerPara
 
 std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
   const KinematicState & start, const PathShape & shape,
-  const geometry_msgs::msg::Pose & goal_pose, double duration, const rclcpp::Time & stamp) const
+  const geometry_msgs::msg::Pose & goal_pose, double duration, const rclcpp::Time & stamp,
+  bool allow_full_stop) const
 {
   // Terminal acceleration is still hardcoded zero: each individual candidate
   // should settle smoothly by its own end regardless of how it started, and
@@ -267,18 +268,40 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::buildCandidate(
     // condition the quintic itself was solved with -- see
     // min_departure_reference_speed's docs for why a genuine v0=0 sample
     // needs this to avoid a mutual deadlock with stock Autoware's own
-    // control stack. Gated by remaining arc length (see
-    // final_approach_distance's docs): only while genuinely far from the
-    // goal, so the last final_approach_distance meters can still decelerate
-    // smoothly all the way to a real stop instead of being artificially
-    // held above the floor right up to the last sample.
+    // control stack.
+    //
+    // allow_full_stop controls whether *any* sample, including the last, is permitted below
+    // the floor at all -- see plan()'s docs for the full rationale (SAE J3016 minimal risk
+    // condition guidance + rear-end collision-risk literature: a maneuver still in progress
+    // must not repeatedly decelerate toward and re-accelerate away from a stop while exposed
+    // on/crossing the shoulder). false (the common case: still converging, goal not yet
+    // independently confirmed safe to fully stop at) floors *every* sample including the
+    // last, so this candidate can move the vehicle but never itself commands a real stop.
+    // true (the caller has confirmed this is the genuine, validated final goal) restores the
+    // original behavior: outside final_approach_distance the floor still applies for a smooth
+    // approach, but inside it the quintic's own true value -- down to a genuine 0 at the very
+    // last sample -- passes through untouched, so the vehicle can actually come to rest.
+    // effective_final_approach_distance caps that zone to at most half the maneuver's own
+    // length, so even a maneuver shorter than final_approach_distance still gets a genuine
+    // departure phase rather than the floor never activating at all (live-verified bug,
+    // 2026-08-15: a maneuver whose entire shape.length() was under final_approach_distance
+    // had the floor never apply anywhere, reproducing the same v0=0 deadlock this floor
+    // exists to prevent).
     const double speed = std::max(0.0, qs.velocity(t));
-    const double remaining_arc_length = shape.length() - s;
-    const double departure_floor = remaining_arc_length > params_.final_approach_distance
-                                      ? params_.min_departure_reference_speed
-                                      : 0.0;
-    point.longitudinal_velocity_mps =
-      static_cast<float>(is_last ? 0.0 : std::max(speed, departure_floor));
+    double floored_speed;
+    if (allow_full_stop) {
+      const double remaining_arc_length = shape.length() - s;
+      const double effective_final_approach_distance =
+        std::min(params_.final_approach_distance, 0.5 * shape.length());
+      const double departure_floor =
+        remaining_arc_length > effective_final_approach_distance
+          ? params_.min_departure_reference_speed
+          : 0.0;
+      floored_speed = is_last ? 0.0 : std::max(speed, departure_floor);
+    } else {
+      floored_speed = std::max(speed, params_.min_departure_reference_speed);
+    }
+    point.longitudinal_velocity_mps = static_cast<float>(floored_speed);
     point.lateral_velocity_mps = 0.0F;
     // Tangential acceleration is exact and direct now that s(t) *is* the
     // longitudinal coordinate -- no vx/vy projection needed.
@@ -461,7 +484,7 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
   const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
   const PredictedObjects & objects, const rclcpp::Time & stamp, std::string * failure_reason,
   bool * blocked_by_traffic, const ShapeHint * preferred_hint, ShapeHint * used_hint,
-  double * out_attempted_curvature) const
+  double * out_attempted_curvature, bool allow_full_stop) const
 {
   if (blocked_by_traffic) {
     *blocked_by_traffic = false;
@@ -500,7 +523,7 @@ std::optional<Trajectory> PullOverTrajectoryPlanner::plan(
                                   const PathShape & shape, double duration,
                                   const std::string & shape_label,
                                   std::string * out_reason) -> std::optional<Trajectory> {
-    auto candidate = buildCandidate(start, shape, goal_pose, duration, stamp);
+    auto candidate = buildCandidate(start, shape, goal_pose, duration, stamp, allow_full_stop);
     if (!candidate.has_value()) {
       return std::nullopt;
     }

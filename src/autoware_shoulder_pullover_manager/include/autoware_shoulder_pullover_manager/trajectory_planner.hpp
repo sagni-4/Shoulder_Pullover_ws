@@ -46,59 +46,51 @@ struct TrajectoryPlannerParams
   double terminal_approach_speed{0.3};  ///< Small nonzero speed (m/s) used only to keep the
                                          ///< heading boundary condition well-defined near the
                                          ///< stop; the actual last sample is force-zeroed.
-  double min_departure_reference_speed{1.0};  ///< m/s floor applied to the non-last samples'
-                                               ///< published speed, but ONLY while more than
-                                               ///< final_approach_distance of arc length
-                                               ///< remains to the goal (see that field and
-                                               ///< buildCandidate) -- never the true v0, which
-                                               ///< stays the quintic's exact boundary condition.
+  double min_departure_reference_speed{2.5};  ///< m/s (~9 km/h) floor applied to published
+                                               ///< speed -- never the true v0, which stays the
+                                               ///< quintic's exact boundary condition.
                                                ///<
-                                               ///< Live-verified bug, 2026-08-13 (root-caused
-                                               ///< from a recorded rosbag, not guessed): this
-                                               ///< value used to be 0.05, chosen only to clear
-                                               ///< stock Autoware's isStoppedState()/steer-
-                                               ///< convergence mutual-deadlock epsilon (the
-                                               ///< controller reads this same near-ego reference
-                                               ///< speed to decide whether the vehicle is "still
-                                               ///< parked" -- see project memory) -- but 0.05 m/s
-                                               ///< (180 m/h) is not a speed a real vehicle visibly
-                                               ///< moves at, and because this planner is a
-                                               ///< receding-horizon replanner that reads ego's
-                                               ///< *actual* speed as next cycle's v0, publishing
-                                               ///< 0.05 m/s caused actual ego speed to converge to
-                                               ///< ~0.05 m/s and *stay* there indefinitely: bag-
-                                               ///< verified /control/command/control_cmd pinned
-                                               ///< at exactly cmd_v=0.050 for 4+ continuous
-                                               ///< seconds while the vehicle was still ~11m from
-                                               ///< the goal. The self-reinforcing mechanism: once
-                                               ///< real v0 drops under ~1.0 m/s, `plan()`'s
-                                               ///< distance/speed-based initial_guess duration
-                                               ///< saturates at max_duration (15s) for the
-                                               ///< remaining ~11m, so the resulting quintic's
-                                               ///< true velocity value sits below the old 0.05
-                                               ///< floor for a large fraction of its samples --
-                                               ///< which are then all flattened to exactly 0.05,
-                                               ///< so real ego speed never climbs back above it
-                                               ///< and the next cycle repeats the same collapsed
-                                               ///< regime. Raising the constant alone would ruin
-                                               ///< the genuine final decel-to-a-stop the last few
-                                               ///< meters need, hence the distance gate: outside
-                                               ///< final_approach_distance this floor keeps
-                                               ///< real progress large enough to see (1.0 m/s,
-                                               ///< matching the same order of magnitude as
-                                               ///< PullOverManagerNode::min_crawl_speed_ and
-                                               ///< comfortably 1000x above the stock
-                                               ///< isStoppedState() epsilon this field was
-                                               ///< originally added to clear), while inside it
-                                               ///< the true quintic value (including down to
-                                               ///< genuine 0) passes through untouched.
+                                               ///< Raised from 1.0 to 2.5 m/s 2026-08-15, user-
+                                               ///< directed: live-testing showed the vehicle
+                                               ///< repeatedly decelerating toward 0 and
+                                               ///< re-accelerating mid-maneuver while still
+                                               ///< exposed on or crossing into the shoulder next
+                                               ///< to moving highway traffic -- explicitly the
+                                               ///< condition SAE J3016's minimal risk condition
+                                               ///< guidance steers away from (its own worked
+                                               ///< examples are "stopped outside active lanes",
+                                               ///< not stopped within/crossing them), and general
+                                               ///< rear-end-collision-risk literature attributes a
+                                               ///< large share of highway crashes to exactly this
+                                               ///< class of low-speed/stopped exposure. 2.5 m/s
+                                               ///< matches the ~10 km/h low-speed "creep"
+                                               ///< convention already standard in automotive
+                                               ///< automatic-transmission/parking-maneuver control
+                                               ///< and equals PullOverManagerNode::min_crawl_speed_
+                                               ///< so the pre-maneuver search phase and the
+                                               ///< in-maneuver phase agree on one minimum.
+                                               ///<
+                                               ///< As of 2026-08-15 this floor is no longer
+                                               ///< conditional on final_approach_distance alone --
+                                               ///< see allow_full_stop's docs on plan(): whether
+                                               ///< the terminal sample is allowed below this
+                                               ///< floor (down to a genuine stop) is decided
+                                               ///< explicitly by the caller, not implicitly by
+                                               ///< remaining distance, so a goal that simply
+                                               ///< looks geometrically close hasn't yet been
+                                               ///< *confirmed* safe to fully stop at can never
+                                               ///< coast down to 0 no matter how close it is.
 
-  double final_approach_distance{2.0};  ///< m. Remaining arc length (to the goal) below which
-                                         ///< min_departure_reference_speed's floor stops being
-                                         ///< applied, letting the quintic's own true (possibly
-                                         ///< near-zero) velocity through so the vehicle can
-                                         ///< actually decelerate to a stop at the goal -- see
-                                         ///< that field's docs for the bug this fixes. Physically
+  double final_approach_distance{2.0};  ///< m. Once a candidate is built with allow_full_stop
+                                         ///< true (see plan()'s docs), the remaining arc length
+                                         ///< below which min_departure_reference_speed's floor
+                                         ///< stops being applied, letting the quintic's own true
+                                         ///< (possibly near-zero) velocity through so the vehicle
+                                         ///< can actually decelerate smoothly to a stop at the
+                                         ///< goal instead of the floor holding speed up right to
+                                         ///< the last sample. Irrelevant when allow_full_stop is
+                                         ///< false -- the floor then applies to every sample
+                                         ///< regardless of remaining distance. Physically
                                          ///< derived, not arbitrary: must be at least the
                                          ///< kinematic stopping distance from the highest speed
                                          ///< that could be commanded when this zone is entered,
@@ -111,7 +103,7 @@ struct TrajectoryPlannerParams
                                          ///< typical 1.0m in PullOverManagerNode, so the
                                          ///< arrival check always evaluates speed *after* this
                                          ///< zone's genuine decel has had room to act.
-  double max_speed{2.0};  ///< m/s. Hard ceiling on every sample's *published* speed, checked
+  double max_speed{3.0};  ///< m/s. Hard ceiling on every sample's *published* speed, checked
                            ///< unconditionally in satisfiesKinematicConstraints() (unlike the
                            ///< curvature/lateral checks below, this is never speed-gated -- it
                            ///< exists specifically to catch runaway speed itself). Added
@@ -124,10 +116,25 @@ struct TrajectoryPlannerParams
                            ///< *middle* samples overshoot well above both boundary speeds even
                            ///< though every other per-sample check passes -- observed live as
                            ///< unchecked acceleration to ~9.3 m/s. This is a slow, precision
-                           ///< entry maneuver (see the struct-level comment above), so 2.0 m/s is
+                           ///< entry maneuver (see the struct-level comment above), so this is
                            ///< a deliberately low ceiling, comfortably under any reasonable
                            ///< external safety-monitor threshold -- this check should trip
                            ///< first, not the external monitor.
+                           ///<
+                           ///< Raised from 2.0 to 3.0 m/s 2026-08-15: live-verified BUG --
+                           ///< min_departure_reference_speed was independently raised to 2.5 m/s
+                           ///< the same day without reconciling it against this ceiling, and
+                           ///< since that floor now applies to *every* sample when
+                           ///< allow_full_stop is false (not just outside some distance gate,
+                           ///< see that field's docs), every single candidate was rejected here
+                           ///< unconditionally -- "speed 2.5 m/s exceeds max 2 m/s at point 0",
+                           ///< every cycle, regardless of goal geometry, confirmed live via
+                           ///< /shoulder_pullover_manager's own log. 3.0 m/s keeps a real margin
+                           ///< above the 2.5 m/s floor for the quintic's own natural profile to
+                           ///< vary within without immediately tripping this ceiling, while
+                           ///< still comfortably below any external safety-monitor threshold.
+                           ///< Keep this and min_departure_reference_speed in the same file in
+                           ///< sync from now on -- they are not independent constants.
 
   double min_path_turn_radius{4.0};   ///< m. Tightest DubinsPath turning radius tried (see
                                        ///< buildCandidate/plan) -- curvature=0.25 1/m, under the
@@ -382,12 +389,24 @@ public:
   /// worsening-curvature trend and abandon early, rather than only seeing a pass/fail bit each
   /// cycle -- see that loop's forward-progress-collapse abandon check for the sibling geometric
   /// signal this complements.
+  /// `allow_full_stop` gates whether the returned trajectory is allowed to command a genuine
+  /// v=0 anywhere at all, including its own terminal point. Default false: every published
+  /// sample (including the terminal one) is floored at
+  /// `params_.min_departure_reference_speed`, so this candidate can move the vehicle but can
+  /// never itself bring it to a real stop. Only pass true once the caller has independently
+  /// confirmed, against ego's actual current pose (not a future trajectory point), that this
+  /// goal is the genuine, validated final stopping point (see
+  /// PullOverManagerNode::isConfirmedSafeToStop's docs) -- e.g. via a heading-alignment and
+  /// shoulder-containment check, not merely "close to some goal". Grounded in SAE J3016's
+  /// minimal risk condition guidance (examples given are explicitly "stopped outside active
+  /// lanes", not stopped within them) and the general collision-risk literature on vehicles
+  /// stopped at very low speed while still exposed to moving traffic.
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> plan(
     const KinematicState & start, const geometry_msgs::msg::Pose & goal_pose,
     const autoware_perception_msgs::msg::PredictedObjects & objects, const rclcpp::Time & stamp,
     std::string * failure_reason = nullptr, bool * blocked_by_traffic = nullptr,
     const ShapeHint * preferred_hint = nullptr, ShapeHint * used_hint = nullptr,
-    double * out_attempted_curvature = nullptr) const;
+    double * out_attempted_curvature = nullptr, bool allow_full_stop = false) const;
 
 private:
   /// Coefficients of a scalar quintic q(t) = c0 + c1 t + c2 t^2 + c3 t^3 +
@@ -413,7 +432,8 @@ private:
   /// used only for its z (ground height); `shape` is 2D+heading only.
   [[nodiscard]] std::optional<autoware_planning_msgs::msg::Trajectory> buildCandidate(
     const KinematicState & start, const PathShape & shape,
-    const geometry_msgs::msg::Pose & goal_pose, double duration, const rclcpp::Time & stamp) const;
+    const geometry_msgs::msg::Pose & goal_pose, double duration, const rclcpp::Time & stamp,
+    bool allow_full_stop) const;
 
   [[nodiscard]] bool satisfiesKinematicConstraints(
     const autoware_planning_msgs::msg::Trajectory & trajectory,

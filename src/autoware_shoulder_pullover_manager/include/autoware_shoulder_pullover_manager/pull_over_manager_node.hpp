@@ -13,6 +13,7 @@
 #include <autoware_planning_msgs/msg/trajectory.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <tier4_system_msgs/msg/mrm_behavior_status.hpp>
 #include <tier4_system_msgs/srv/operate_mrm.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -22,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace autoware::shoulder_pullover_manager
 {
@@ -248,6 +250,43 @@ private:
   /// "Pull Over" indefinitely. Requesting STOP here closes that loop.
   void requestOperationModeStop();
 
+  /// True iff `ego_pose` (at `ego_speed`) is confirmed, by every independent criterion
+  /// available, to be the genuine final pull-over position -- not merely "close to
+  /// active_goal_'s point". Checks, all required:
+  ///  1. distance_to_goal <= arrival_distance_threshold_ (existing).
+  ///  2. |heading_error| <= arrival_heading_threshold_ (existing) -- ego's heading aligned
+  ///     with the shoulder's own local direction (active_goal_'s orientation is
+  ///     GoalScorer::smoothedHeading() from the live centerline at selection time, i.e.
+  ///     already the shoulder's tangent, not an arbitrary pose).
+  ///  3. Lateral containment -- ego's actual footprint, not just its reference point, fits
+  ///     within the *measured* shoulder half-width (see latest_shoulder_halfwidth_'s docs) at
+  ///     the nearest live centerline point to ego_pose, with vehicle_half_width_ +
+  ///     lateral_safety_margin_ of clearance. Fails closed (returns false) if no measured
+  ///     width data is available and require_shoulder_containment_ is true (the default).
+  /// This is deliberately a *stricter, independent* gate than the plain arrival check used to
+  /// be -- see plan()'s allow_full_stop docs for why: this function's result is what decides
+  /// whether the current planning cycle is even allowed to command the vehicle toward a real
+  /// stop at all, not just whether to declare kSucceeded after the fact.
+  [[nodiscard]] bool isConfirmedSafeToStop(
+    const geometry_msgs::msg::Pose & ego_pose, double ego_speed, double distance_to_goal,
+    double heading_error) const;
+
+  /// latest_shoulder_halfwidth_'s data as a vector iff it is present AND index-aligned
+  /// (size-matched) with latest_centerline_ as it stands right now; empty otherwise --
+  /// the exact "usable width data" condition both GoalScorer::selectBestGoal (goal gate)
+  /// and isConfirmedSafeToStop (arrival gate) need, factored here so the two can never
+  /// disagree about whether data exists.
+  [[nodiscard]] std::vector<float> usableHalfWidths() const;
+
+  /// The actual, unconditional stand-down: resets state_ to kIdle and clears every piece of
+  /// in-progress maneuver state (active_goal_, last_trajectory_, override state, etc). Shared
+  /// by onOperateMrm()'s immediate path (nothing was in progress to protect) and
+  /// onPlanningTimer()'s grace-period-elapsed path (something *was* in progress, but the
+  /// cancel held for standdown_grace_period_ with no re-engage, so it's treated as real) --
+  /// see standdown_requested_since_'s docs for why those are no longer the same code path
+  /// they used to be. `reason` is purely for the log line.
+  void performStandDown(const std::string & reason);
+
   /// Shared by both kDecelerating and kOperating -- publishes `trajectory`
   /// on every configured output (debug trajectory/path/marker, and
   /// direct_trajectory_output_topic_ if set).
@@ -351,6 +390,36 @@ private:
                                             ///< enough to guarantee a visibly-parallel final
                                             ///< heading while staying comfortably above any
                                             ///< residual per-cycle replanning/tracking noise.
+  /// User-directed 2026-08-15, added alongside distance/speed/heading above as a fourth,
+  /// independent arrival criterion: is the vehicle's actual footprint, not just its reference
+  /// point, laterally contained within the *measured* shoulder width at ego's current position?
+  /// Grounded in the same automated-parking-assist practice as arrival_heading_threshold_
+  /// (checking the vehicle's actual extent against the target space, not just a point-pose
+  /// match) plus the practical concern that "close to the goal point" alone says nothing about
+  /// whether part of the vehicle still overhangs back into the travel lane. Uses
+  /// shoulder_centerline_node's measured half-width (see isConfirmedSafeToStop()'s docs) -- not
+  /// an assumed constant -- so this reflects the *actual* shoulder at this specific spot.
+  double lateral_safety_margin_{0.3};  ///< m. Extra clearance required beyond the vehicle's own
+                                        ///< half-width before the shoulder is considered wide
+                                        ///< enough -- absorbs localization/perception error and
+                                        ///< leaves a visible, non-hairline gap from the shoulder
+                                        ///< edge, similar in spirit to standard parking-assist
+                                        ///< clearance margins.
+  /// If true (default) and no measured shoulder-width data is available (topic never received,
+  /// or shoulder_centerline_node running in "median" mode, which has no extent to measure --
+  /// see lateralHalfWidth()'s docs in that package), containment can never be confirmed and the
+  /// vehicle keeps crawling at min_crawl_speed_/min_departure_reference_speed_ instead of
+  /// stopping -- fails closed rather than silently skipping the check, consistent with this
+  /// being a safety-relevant criterion the user explicitly asked for. Set false only for
+  /// environments/tests that intentionally don't run shoulder_centerline_node with width
+  /// publishing (falls back to distance+speed+heading only, the pre-2026-08-15 behavior).
+  bool require_shoulder_containment_{true};
+  /// Half of the vehicle's real width, computed at startup from wheel_tread/left_overhang/
+  /// right_overhang (the same vehicle_info fields every other Autoware node in this launch
+  /// receives) as 0.5*wheel_tread + max(left_overhang, right_overhang) -- the standard
+  /// Autoware vehicle_info width formula, not an assumed constant. Used by
+  /// isConfirmedSafeToStop()'s containment check.
+  double vehicle_half_width_{0.95};
   int max_consecutive_planning_failures_{30};
   int max_consecutive_traffic_blocked_cycles_{300};  ///< See consecutive_traffic_blocked_cycles_.
   double deceleration_lookahead_distance_{40.0};  ///< m. How far ahead (along ego's current
@@ -367,15 +436,31 @@ private:
                                                       ///< always above this) -- superseded by
                                                       ///< kdecelerating_giveup_duration_. Left
                                                       ///< declared for config-file compatibility.
-  double min_crawl_speed_{1.0};  ///< m/s. Live-verified 2026-08-13: the floor below which
-                                  ///< autoware_pid_longitudinal_controller's STOPPED-state
+  double min_crawl_speed_{2.5};  ///< m/s (~9 km/h). Live-verified 2026-08-13: the floor below
+                                  ///< which autoware_pid_longitudinal_controller's STOPPED-state
                                   ///< departure logic can latch indefinitely -- comfortably
                                   ///< clears every zero-velocity epsilon found in that stock
                                   ///< controller (vel_epsilon=1e-3, stopped_state_entry_vel=0.01,
-                                  ///< MPC's stop_state_entry_target_speed=0.001) by two-plus
-                                  ///< orders of magnitude. Never let actual commanded speed drop
-                                  ///< below this while kDecelerating or contingency-holding
-                                  ///< during kOperating -- see buildCrawlTrajectory().
+                                  ///< MPC's stop_state_entry_target_speed=0.001) by orders of
+                                  ///< magnitude. Never let actual commanded speed drop below
+                                  ///< this while kDecelerating or contingency-holding during
+                                  ///< kOperating -- see buildCrawlTrajectory().
+                                  ///<
+                                  ///< Raised from 1.0 to 2.5 m/s 2026-08-15, user-directed: on a
+                                  ///< highway with moving traffic, crawling near-zero (or briefly
+                                  ///< re-stopping) anywhere before the vehicle is safely off the
+                                  ///< active lane is itself a hazard, not just an inconvenience --
+                                  ///< SAE J3016's minimal risk condition guidance explicitly
+                                  ///< favors stopping *outside* active lanes over stopping within
+                                  ///< them, and rear-end collisions are consistently one of the
+                                  ///< largest categories of highway crashes in general collision
+                                  ///< statistics. 2.5 m/s matches the ~10 km/h low-speed "creep"
+                                  ///< convention already standard for automotive low-speed
+                                  ///< maneuvering (parking, automatic-transmission creep torque
+                                  ///< caps) and now equals TrajectoryPlannerParams::
+                                  ///< min_departure_reference_speed so the search phase (this
+                                  ///< field) and the in-maneuver phase (that one, via plan()'s
+                                  ///< allow_full_stop) agree on one minimum.
   double crawl_deceleration_{0.5};  ///< m/s^2. Deceleration rate buildCrawlTrajectory() ramps
                                      ///< down at, from ego_speed to min_crawl_speed_, before
                                      ///< holding constant -- see that function's docs.
@@ -422,12 +507,18 @@ private:
                                             ///< ~4.5 m/s: ramp_duration=(4.5-1.0)/0.5=7.0s) with
                                             ///< some hold-phase margin left over, rather than the
                                             ///< published trajectory ending mid-ramp.
-  double kdecelerating_giveup_duration_{20.0};  ///< s. If kDecelerating has been searching this
+  double kdecelerating_giveup_duration_{40.0};  ///< s. If kDecelerating has been searching this
                                                  ///< long with still no feasible shoulder goal,
                                                  ///< give up -- replaces the old speed-threshold
                                                  ///< give-up, which no longer fires now that
                                                  ///< speed floors at min_crawl_speed_ instead of
-                                                 ///< decaying toward 0.
+                                                 ///< decaying toward 0. Raised 20->40 2026-08-16
+                                                 ///< alongside the measured-width goal gate
+                                                 ///< (goal_scorer.hpp): wide-enough shoulder
+                                                 ///< pockets are sparser than "any shoulder", so
+                                                 ///< the crawl may legitimately need to cover
+                                                 ///< more ground (~100m at min_crawl_speed_)
+                                                 ///< before one enters lookahead range.
   std::string direct_trajectory_output_topic_;  ///< Empty (default) = debug-only, see docs above.
   bool controller_stop_dist_override_enabled_{true};
   std::string controller_node_name_{"/control/trajectory_follower/controller_node_exe"};
@@ -448,6 +539,13 @@ private:
 
   // --- Latest observed state (executor thread only, except the atomic) ---
   nav_msgs::msg::Path::ConstSharedPtr latest_centerline_;
+  /// Index-aligned with latest_centerline_->poses (data[i] is the measured half-width, meters,
+  /// at poses[i]) -- see shoulder_centerline_node's halfwidth_pub_ docs for how it's measured.
+  /// Independently timestamped/updated from latest_centerline_ itself (separate topic), so a
+  /// size mismatch against the *current* latest_centerline_ is possible for one cycle right
+  /// after either updates -- isConfirmedSafeToStop() guards against that explicitly rather than
+  /// assuming the two always agree in length.
+  std_msgs::msg::Float32MultiArray::ConstSharedPtr latest_shoulder_halfwidth_;
   nav_msgs::msg::Odometry::ConstSharedPtr latest_odometry_;
   autoware_perception_msgs::msg::PredictedObjects latest_objects_;
   bool autonomous_mode_engaged_{false};
@@ -577,6 +675,69 @@ private:
   /// acceleration state.
   std::optional<autoware_planning_msgs::msg::Trajectory> last_trajectory_;
 
+  /// Set the instant an OperateMrm(operate=false) arrives while a maneuver is actively
+  /// in progress (kOperating/kDecelerating); cleared either by a fresh operate=true
+  /// arriving before standdown_grace_period_ elapses (treated as a false alarm -- resume
+  /// with no state lost) or by the grace period actually elapsing (a real stand-down,
+  /// performed then). See onOperateMrm()'s and standdown_grace_period_'s docs for why this
+  /// exists: mrm_handler cancels this node's OperateMrm service on every upstream
+  /// availability blip, not only on a genuine operator decision to abandon pull-over --
+  /// live rosbag-confirmed 2026-08-15 (root-caused via /diagnostics_graph/struct+/status,
+  /// see project memory) that an intermittent ekf_localizer WARN under
+  /// /autoware/localization/sensor_fusion_status, with no hysteresis applied to it,
+  /// propagates through mrm_handler's own AND-gated availability check and cancels+re-calls
+  /// this service every ~1-2s for well over a minute at a stretch. Before this field
+  /// existed, every single one of those cancels immediately threw away the active goal and
+  /// all trajectory/warm-start state (see the old unconditional reset this replaces), so the
+  /// vehicle was repeatedly restarting its approach from scratch -- accelerating toward a
+  /// freshly-reselected goal, then getting cancelled again before traveling more than a few
+  /// centimeters -- and never made net progress. This node has no ability to fix the
+  /// upstream diagnostic or mrm_handler's own re-evaluation logic (not this project's code,
+  /// see project scope notes) -- the only lever available here is not overreacting to a
+  /// same-service cancel/re-call pair that arrives faster than a maneuver could plausibly
+  /// have been abandoned and reconsidered for real.
+  std::optional<rclcpp::Time> standdown_requested_since_;
+  /// Seconds an OperateMrm(operate=false) must persist, with no intervening operate=true,
+  /// before it's treated as a genuine stand-down rather than an upstream availability blip
+  /// -- see standdown_requested_since_'s docs.
+  ///
+  /// Raised from an initial 3.0s to 90.0s, 2026-08-15, after live data showed 3.0s was still
+  /// far too short: /diagnostics_graph/status (see project memory for the capture/analysis
+  /// technique) showed individual ekf_localizer WARN episodes lasting up to 70.76s, and a
+  /// live re-test with the 3.0s grace period still recorded 6 full stand-downs (each
+  /// discarding the selected goal and restarting the approach) in under 2 minutes -- the fix
+  /// was directionally correct but sized against the *typical* blip, not the *worst observed*
+  /// one. 90s gives >19s of margin over the worst episode seen so far.
+  ///
+  /// This is deliberately NOT a small, "safe-because-it's-short" number, and that is
+  /// intentional, not an oversight: standing down early is not actually the safer choice
+  /// here. autoware_vehicle_cmd_gate independently enforces real vehicle safety off of
+  /// `/api/fail_safe/mrm_state` directly (`onMrmState()`/`is_system_emergency_`, live-
+  /// confirmed 2026-08-15 via rosbag: whenever mrm_handler reports EMERGENCY_STOP, the real
+  /// published `/control/command/control_cmd` visibly switches to mrm_emergency_stop_
+  /// operator's own commands, not this node's, regardless of what this node internally
+  /// believes or publishes) -- so a long pending-standdown window on *this* node's side does
+  /// not, on its own, let the vehicle do anything unsafe: whatever this node keeps computing
+  /// is moot while the real emergency behavior is active, and simply resumes cleanly, with
+  /// its goal and warm-start state intact, the moment mrm_handler hands PULL_OVER back. What
+  /// a short grace period actually bought was the opposite of safety: needless full resets of
+  /// an otherwise-fine maneuver, each one restarting the approach and burning through the
+  /// *overall* MRM's limited patience (mrm_handler's own escalation-to-EMERGENCY_STOP-for-
+  /// good, see project memory) without ever making net progress -- a textbook case of
+  /// oscillating behavior selection needing a commitment/hysteresis threshold rather than a
+  /// fast reaction, a well-established pattern in autonomous-vehicle behavior arbitration
+  /// literature for exactly this "cost/availability signal flickers, selected behavior
+  /// shouldn't" failure mode.
+  ///
+  /// Still bounded, not infinite, for two independent reasons: `autonomous_mode_engaged_`
+  /// dropping is checked separately (see onOperateMrm()) and forces an immediate real stand-
+  /// down regardless of this timer -- a genuine loss of autonomous control is a strictly
+  /// stronger, much less noisy signal than a diagnostic-derived availability flag, and always
+  /// wins outright. And even absent that, 90s is still a firm ceiling: if availability truly
+  /// never recovers, this node gives up for real at the deadline rather than holding a
+  /// half-triggered state forever.
+  double standdown_grace_period_{90.0};
+
   /// True once original_drive_state_stop_dist_ has been successfully read
   /// from the live controller at startup -- pushControllerStopDistOverride()
   /// refuses to act (and logs a warning) until this is true, since without a
@@ -608,6 +769,7 @@ private:
 
   // --- ROS interfaces ---------------------------------------------------
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr centerline_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr shoulder_halfwidth_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
   rclcpp::Subscription<autoware_perception_msgs::msg::PredictedObjects>::SharedPtr objects_sub_;
   rclcpp::Subscription<autoware_adapi_v1_msgs::msg::OperationModeState>::SharedPtr

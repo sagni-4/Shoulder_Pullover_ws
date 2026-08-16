@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -82,6 +83,20 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
     declare_parameter<double>("max_maneuver_jerk", scorer_params_.max_maneuver_jerk);
   scorer_params_.heading_smoothing_distance = declare_parameter<double>(
     "heading_smoothing_distance", scorer_params_.heading_smoothing_distance);
+  // Measured-width gate (added 2026-08-16, see goal_scorer.hpp) -- vehicle_half_width
+  // itself is populated below from the same vehicle_info fields the arrival gate uses.
+  scorer_params_.goal_width_margin =
+    declare_parameter<double>("goal_width_margin", scorer_params_.goal_width_margin);
+  scorer_params_.width_measurement_scale = declare_parameter<double>(
+    "width_measurement_scale", scorer_params_.width_measurement_scale);
+  scorer_params_.width_window_half_length = declare_parameter<double>(
+    "width_window_half_length", scorer_params_.width_window_half_length);
+  scorer_params_.weight_width =
+    declare_parameter<double>("weight_width", scorer_params_.weight_width);
+  scorer_params_.reference_extra_half_width = declare_parameter<double>(
+    "reference_extra_half_width", scorer_params_.reference_extra_half_width);
+  scorer_params_.require_width_data =
+    declare_parameter<bool>("require_width_data", scorer_params_.require_width_data);
 
   // --- Parameters: trajectory planning --------------------------------------
   trajectory_params_.dt = declare_parameter<double>("trajectory_dt", trajectory_params_.dt);
@@ -133,10 +148,26 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   arrival_speed_threshold_ = declare_parameter<double>("arrival_speed_threshold", 0.2);
   arrival_heading_threshold_ =
     declare_parameter<double>("arrival_heading_threshold", arrival_heading_threshold_);
+  lateral_safety_margin_ =
+    declare_parameter<double>("lateral_safety_margin", lateral_safety_margin_);
+  require_shoulder_containment_ =
+    declare_parameter<bool>("require_shoulder_containment", require_shoulder_containment_);
+  // Same vehicle_info fields (wheel_tread, left_overhang, right_overhang) every other node in
+  // this launch receives -- see vehicle_half_width_'s docs for the formula. Declared with
+  // sample_vehicle's own known values as defaults so a standalone launch (no vehicle_info
+  // params passed at all) still gets a real number instead of silently defaulting to 0.
+  {
+    const double wheel_tread = declare_parameter<double>("wheel_tread", 1.64);
+    const double left_overhang = declare_parameter<double>("left_overhang", 0.128);
+    const double right_overhang = declare_parameter<double>("right_overhang", 0.128);
+    vehicle_half_width_ = 0.5 * wheel_tread + std::max(left_overhang, right_overhang);
+  }
   max_consecutive_planning_failures_ =
     declare_parameter<int>("max_consecutive_planning_failures", 30);
   max_consecutive_traffic_blocked_cycles_ =
     declare_parameter<int>("max_consecutive_traffic_blocked_cycles", 300);
+  standdown_grace_period_ =
+    declare_parameter<double>("standdown_grace_period", standdown_grace_period_);
   deceleration_lookahead_distance_ = declare_parameter<double>(
     "deceleration_lookahead_distance", deceleration_lookahead_distance_);
   deceleration_giveup_speed_threshold_ = declare_parameter<double>(
@@ -194,6 +225,10 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   // can never drift out of consistency with each other.
   scorer_params_.max_reachable_distance =
     0.9 * (15.0 / 8.0) * trajectory_params_.max_speed * trajectory_params_.max_duration;
+  // Same computed value the arrival containment gate uses -- goal selection and arrival
+  // must agree on how wide the vehicle actually is (see goal_scorer.hpp's
+  // vehicle_half_width docs).
+  scorer_params_.vehicle_half_width = vehicle_half_width_;
   goal_scorer_ = std::make_unique<GoalScorer>(scorer_params_);
   trajectory_planner_ = std::make_unique<PullOverTrajectoryPlanner>(trajectory_params_);
 
@@ -281,6 +316,15 @@ PullOverManagerNode::PullOverManagerNode(const rclcpp::NodeOptions & options)
   centerline_sub_ = create_subscription<nav_msgs::msg::Path>(
     centerline_topic, rclcpp::QoS(1),
     [this](const nav_msgs::msg::Path::ConstSharedPtr msg) { onCenterline(msg); });
+
+  // Published by shoulder_centerline_node index-aligned with centerline_topic's poses -- see
+  // isConfirmedSafeToStop()'s docs. Naming matches that node's halfwidth_pub_ (its own topic
+  // name + "_halfwidth"), not independently configurable here to keep the pairing unambiguous.
+  shoulder_halfwidth_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
+    centerline_topic + "_halfwidth", rclcpp::QoS(1),
+    [this](const std_msgs::msg::Float32MultiArray::ConstSharedPtr msg) {
+      latest_shoulder_halfwidth_ = msg;
+    });
 
   odometry_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     odometry_topic, rclcpp::QoS(1),
@@ -384,27 +428,69 @@ void PullOverManagerNode::onOperateMrm(
   std::shared_ptr<tier4_system_msgs::srv::OperateMrm::Response> response)
 {
   if (!request->operate) {
-    RCLCPP_INFO(get_logger(), "OperateMrm(operate=false) received -- standing down.");
-    state_ = ManagerState::kIdle;
-    active_goal_.reset();
-    active_goal_shape_hint_.reset();
-    deceleration_goal_.reset();
-    deceleration_goal_shape_hint_.reset();
-    last_trajectory_.reset();
-    zero_speed_since_.reset();
-    contingency_stop_goal_.reset();
-    contingency_stop_goal_shape_hint_.reset();
-    consecutive_traffic_blocked_cycles_ = 0;
-    restoreControllerStopDistOverride();
-    restoreAebImuPathOverride();
+    if (state_ == ManagerState::kOperating || state_ == ManagerState::kDecelerating) {
+      // See standdown_requested_since_'s docs -- don't throw away an active maneuver on the
+      // first cancel; give it standdown_grace_period_ to either be reversed by a fresh
+      // operate=true (an upstream blip, not a real decision) or actually elapse
+      // (onPlanningTimer() performs the real stand-down then).
+      if (!standdown_requested_since_.has_value()) {
+        standdown_requested_since_ = now();
+        RCLCPP_INFO(
+          get_logger(),
+          "OperateMrm(operate=false) received while a maneuver is active -- starting a %.1fs "
+          "grace period before actually standing down, instead of discarding progress "
+          "immediately (see standdown_requested_since_'s docs).",
+          standdown_grace_period_);
+      }
+      response->response.success = true;
+      response->response.message = "cancel acknowledged, pending grace period";
+      return;
+    }
+    performStandDown("OperateMrm(operate=false) received");
     response->response.success = true;
     response->response.message = "stood down";
+    return;
+  }
+
+  if (standdown_requested_since_.has_value()) {
+    // A pending cancel is being reversed by a fresh engage before the grace period elapsed --
+    // exactly the upstream-blip case standdown_requested_since_ exists to absorb. Resume
+    // without touching active_goal_/last_trajectory_/anything else -- there is nothing to
+    // re-trigger since, from this node's own state machine's perspective, the maneuver never
+    // actually stopped.
+    RCLCPP_INFO(
+      get_logger(),
+      "OperateMrm(operate=true) received %.2fs into a pending grace-period stand-down -- "
+      "treating the cancel as a transient upstream blip and resuming without resetting "
+      "progress.",
+      (now() - *standdown_requested_since_).seconds());
+    standdown_requested_since_.reset();
+    response->response.success = true;
+    response->response.message = "already in progress -- pending stand-down cancelled";
     return;
   }
 
   const auto [success, message] = triggerPullOver("OperateMrm service");
   response->response.success = success;
   response->response.message = message;
+}
+
+void PullOverManagerNode::performStandDown(const std::string & reason)
+{
+  RCLCPP_INFO(get_logger(), "%s -- standing down.", reason.c_str());
+  state_ = ManagerState::kIdle;
+  active_goal_.reset();
+  active_goal_shape_hint_.reset();
+  deceleration_goal_.reset();
+  deceleration_goal_shape_hint_.reset();
+  last_trajectory_.reset();
+  zero_speed_since_.reset();
+  contingency_stop_goal_.reset();
+  contingency_stop_goal_shape_hint_.reset();
+  consecutive_traffic_blocked_cycles_ = 0;
+  standdown_requested_since_.reset();
+  restoreControllerStopDistOverride();
+  restoreAebImuPathOverride();
 }
 
 // --- Timers ---------------------------------------------------------------
@@ -611,6 +697,80 @@ void PullOverManagerNode::restoreAebImuPathOverride()
   RCLCPP_INFO(get_logger(), "Restored '%s' use_imu_path=true.", aeb_node_name_.c_str());
 }
 
+std::vector<float> PullOverManagerNode::usableHalfWidths() const
+{
+  if (
+    !latest_centerline_ || !latest_shoulder_halfwidth_ ||
+    latest_shoulder_halfwidth_->data.size() != latest_centerline_->poses.size()) {
+    return {};
+  }
+  return latest_shoulder_halfwidth_->data;
+}
+
+bool PullOverManagerNode::isConfirmedSafeToStop(
+  const geometry_msgs::msg::Pose & ego_pose, double ego_speed, double distance_to_goal,
+  double heading_error) const
+{
+  (void)ego_speed;  // Not itself a gate here -- see docs: this answers "is this position/
+                     // heading/width combination the genuine goal", speed is checked
+                     // separately by the caller before declaring kSucceeded.
+  if (distance_to_goal > arrival_distance_threshold_) {
+    return false;
+  }
+  if (std::abs(heading_error) > arrival_heading_threshold_) {
+    return false;
+  }
+
+  if (!latest_centerline_ || latest_centerline_->poses.empty()) {
+    return !require_shoulder_containment_;
+  }
+  if (
+    !latest_shoulder_halfwidth_ ||
+    latest_shoulder_halfwidth_->data.size() != latest_centerline_->poses.size()) {
+    // Genuinely no measured width for the centerline as it stands right now (topic never
+    // arrived, or arrived once but is momentarily out of step with a just-updated centerline --
+    // see latest_shoulder_halfwidth_'s docs) -- can't confirm containment this cycle.
+    return !require_shoulder_containment_;
+  }
+
+  // Nearest live centerline point to ego's *current* position (not to active_goal_, which can
+  // be stale by now) -- gives the width measurement that's actually relevant to where the
+  // vehicle really is.
+  std::size_t nearest_index = 0;
+  double nearest_dist_sq = std::numeric_limits<double>::max();
+  for (std::size_t i = 0; i < latest_centerline_->poses.size(); ++i) {
+    const auto & p = latest_centerline_->poses[i].pose.position;
+    const double dx = p.x - ego_pose.position.x;
+    const double dy = p.y - ego_pose.position.y;
+    const double dist_sq = dx * dx + dy * dy;
+    if (dist_sq < nearest_dist_sq) {
+      nearest_dist_sq = dist_sq;
+      nearest_index = i;
+    }
+  }
+
+  // Lateral (perpendicular-to-ego-heading) offset from ego to that nearest centerline point.
+  // Heading has already been confirmed aligned with the shoulder direction above, so ego's own
+  // heading is a valid stand-in for the local shoulder tangent here -- no need to separately
+  // recompute a smoothed centerline tangent.
+  const auto & nearest_point = latest_centerline_->poses[nearest_index].pose.position;
+  const double ego_yaw = yawFromQuaternionLocal(ego_pose.orientation);
+  const double to_point_x = nearest_point.x - ego_pose.position.x;
+  const double to_point_y = nearest_point.y - ego_pose.position.y;
+  const double lateral_offset =
+    std::abs(-std::sin(ego_yaw) * to_point_x + std::cos(ego_yaw) * to_point_y);
+
+  // Same scale the goal-side width gate applies (identity by default, see
+  // goal_scorer.hpp's width_measurement_scale docs) -- routed through the same parameter
+  // so goal selection and arrival confirmation can never judge the same physical spot by
+  // different yardsticks.
+  const double half_width =
+    scorer_params_.width_measurement_scale *
+    static_cast<double>(latest_shoulder_halfwidth_->data[nearest_index]);
+  const double required_half_width = lateral_offset + vehicle_half_width_ + lateral_safety_margin_;
+  return required_half_width <= half_width;
+}
+
 void PullOverManagerNode::requestOperationModeStop()
 {
   if (!change_to_stop_client_->service_is_ready()) {
@@ -663,6 +823,29 @@ void PullOverManagerNode::onPlanningTimer()
   if (state_ != ManagerState::kDecelerating && state_ != ManagerState::kOperating) {
     return;
   }
+
+  // See standdown_requested_since_'s docs -- a pending cancel that has held for the full
+  // grace period with no re-engage is treated as real, and this is where that actually
+  // happens (onOperateMrm() only starts the timer; it never performs the reset itself while
+  // a maneuver is active). Checked every planning cycle so it fires as close to the deadline
+  // as this timer's own period allows, not just on the next OperateMrm call.
+  //
+  // Loss of autonomous mode is checked first and independently, and always wins immediately
+  // regardless of how much of the grace period remains -- unlike the diagnostic-derived
+  // availability flag this grace period exists to absorb noise from, actually leaving
+  // AUTONOMOUS is a direct, unambiguous fact about vehicle control, not something that
+  // legitimately needs debouncing.
+  if (standdown_requested_since_.has_value() && require_autonomous_mode_ && !autonomous_mode_engaged_) {
+    performStandDown("Autonomous mode lost while a stand-down was pending");
+    return;
+  }
+  if (
+    standdown_requested_since_.has_value() &&
+    (now() - *standdown_requested_since_).seconds() >= standdown_grace_period_) {
+    performStandDown("Pending stand-down grace period elapsed with no re-engage");
+    return;
+  }
+
   if (!latest_odometry_) {
     return;  // Can't plan without knowing where we are.
   }
@@ -679,7 +862,7 @@ void PullOverManagerNode::onPlanningTimer()
     // threshold to wait for instead.
     if (latest_centerline_ && !latest_centerline_->poses.empty()) {
       const auto goal =
-        goal_scorer_->selectBestGoal(*latest_centerline_, ego_pose, ego_speed);
+        goal_scorer_->selectBestGoal(*latest_centerline_, ego_pose, ego_speed, usableHalfWidths());
       // Live-verified bug, 2026-08-13: GoalScorer has no notion of
       // trajectory_params_.max_speed (a *hard, unconditional* ceiling
       // PullOverTrajectoryPlanner::plan() checks on every candidate's point[0] --
@@ -699,10 +882,10 @@ void PullOverManagerNode::onPlanningTimer()
         RCLCPP_INFO(
           get_logger(),
           "Feasible shoulder goal now reachable at %.2f m/s (score=%.3f distance=%.1fm "
-          "maneuver_curvature=%.4f maneuver_initial_jerk=%.3f) -- switching from in-lane "
-          "braking to the pull-over maneuver.",
+          "maneuver_curvature=%.4f maneuver_initial_jerk=%.3f measured_half_width=%.2fm) -- "
+          "switching from in-lane braking to the pull-over maneuver.",
           ego_speed, goal->score, goal->distance_from_ego, goal->maneuver_curvature,
-          goal->maneuver_initial_jerk);
+          goal->maneuver_initial_jerk, goal->measured_half_width);
         active_goal_ = goal->pose;
         deceleration_goal_.reset();
         deceleration_goal_shape_hint_.reset();
@@ -757,13 +940,21 @@ void PullOverManagerNode::onPlanningTimer()
   while (heading_error > M_PI) heading_error -= 2.0 * M_PI;
   while (heading_error < -M_PI) heading_error += 2.0 * M_PI;
 
-  if (
-    distance_to_goal <= arrival_distance_threshold_ && ego_speed <= arrival_speed_threshold_ &&
-    std::abs(heading_error) <= arrival_heading_threshold_) {
+  // See isConfirmedSafeToStop()'s docs -- this is the single decision point for both (a)
+  // whether this cycle's plan() call below is even allowed to command a real stop, and (b)
+  // whether kSucceeded can fire once ego is also actually slow enough. Splitting those two
+  // (position/heading/containment confirmed vs. actually-at-rest) rather than one combined
+  // check is deliberate: (a) has to be evaluated and acted on *before* ego is slow, so the
+  // final decel-to-stop trajectory itself is what brings speed down, matching how a real
+  // parking maneuver works.
+  const bool confirmed_safe_to_stop =
+    isConfirmedSafeToStop(ego_pose, ego_speed, distance_to_goal, heading_error);
+
+  if (confirmed_safe_to_stop && ego_speed <= arrival_speed_threshold_) {
     RCLCPP_INFO(
       get_logger(),
-      "Arrived at pull-over goal (distance=%.2fm, speed=%.2fm/s, heading_error=%.3frad) -- "
-      "maneuver succeeded.",
+      "Arrived at pull-over goal (distance=%.2fm, speed=%.2fm/s, heading_error=%.3frad, "
+      "shoulder containment confirmed) -- maneuver succeeded.",
       distance_to_goal, ego_speed, heading_error);
     state_ = ManagerState::kSucceeded;
     active_goal_.reset();
@@ -792,7 +983,15 @@ void PullOverManagerNode::onPlanningTimer()
   // every cycle against ego's *current* pose) rather than grinding through
   // max_consecutive_planning_failures_ cycles against a goal that has become geometrically
   // impossible and giving up on the whole maneuver outright.
-  {
+  // Live-verified BUG, 2026-08-15: forward_progress (a projection) is always <=
+  // distance_to_goal (Cauchy-Schwarz), so as ego genuinely converges toward arrival this check
+  // unconditionally fires *before* distance_to_goal can ever reach arrival_distance_threshold_
+  // -- the goal gets abandoned just short of every genuine arrival, not just near-singular
+  // sidesteps. Gated on distance_to_goal also still being outside
+  // min_maneuver_forward_progress: a real near-singular sidestep has large residual lateral
+  // offset (small forward_progress, *large* distance_to_goal); normal final-approach
+  // convergence has both shrink together. Only the former should abandon.
+  if (distance_to_goal > scorer_params_.min_maneuver_forward_progress) {
     const double ego_yaw = yawFromQuaternionLocal(ego_pose.orientation);
     const double to_goal_x = active_goal_->position.x - ego_pose.position.x;
     const double to_goal_y = active_goal_->position.y - ego_pose.position.y;
@@ -829,10 +1028,14 @@ void PullOverManagerNode::onPlanningTimer()
   bool blocked_by_traffic = false;
   PullOverTrajectoryPlanner::ShapeHint used_hint;
   double attempted_curvature = 0.0;
+  // allow_full_stop=confirmed_safe_to_stop -- see plan()'s docs and isConfirmedSafeToStop()'s:
+  // only once position, heading, AND shoulder containment are all independently confirmed does
+  // this cycle's candidate get to command a genuine decel-to-a-stop; otherwise every sample,
+  // including its terminal one, stays floored at min_departure_reference_speed.
   const auto trajectory = trajectory_planner_->plan(
     start, *active_goal_, latest_objects_, plan_stamp, &failure_reason, &blocked_by_traffic,
     active_goal_shape_hint_ ? &*active_goal_shape_hint_ : nullptr, &used_hint,
-    &attempted_curvature);
+    &attempted_curvature, confirmed_safe_to_stop);
 
   if (trajectory.has_value()) {
     active_goal_shape_hint_ = used_hint;
@@ -866,10 +1069,13 @@ void PullOverManagerNode::onPlanningTimer()
     }
     std::string contingency_reason;
     PullOverTrajectoryPlanner::ShapeHint contingency_used_hint;
+    // allow_full_stop=true here (unlike the main goal-directed plan() call above): a real
+    // object is detected in the way, so this genuinely must be able to decelerate all the way
+    // to 0 -- not the "still converging, don't stop yet" case allow_full_stop was added for.
     const auto contingency_trajectory = trajectory_planner_->plan(
       start, *contingency_stop_goal_, latest_objects_, plan_stamp, &contingency_reason, nullptr,
       contingency_stop_goal_shape_hint_ ? &*contingency_stop_goal_shape_hint_ : nullptr,
-      &contingency_used_hint);
+      &contingency_used_hint, nullptr, true);
     if (contingency_trajectory.has_value()) {
       contingency_stop_goal_shape_hint_ = contingency_used_hint;
       publishTrajectory(*contingency_trajectory);
@@ -1173,7 +1379,7 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
     latest_odometry_->twist.twist.linear.x, latest_odometry_->twist.twist.linear.y);
 
   const auto goal = goal_scorer_->selectBestGoal(
-    *latest_centerline_, latest_odometry_->pose.pose, ego_speed);
+    *latest_centerline_, latest_odometry_->pose.pose, ego_speed, usableHalfWidths());
 
   // See the matching check in onPlanningTimer()'s kDecelerating branch: a goal
   // GoalScorer accepts is not necessarily executable *yet* if ego_speed is still
@@ -1201,11 +1407,11 @@ std::pair<bool, std::string> PullOverManagerNode::triggerPullOver(const std::str
   RCLCPP_INFO(
     get_logger(),
     "Selected shoulder goal at (%.2f, %.2f): score=%.3f distance=%.1fm curvature=%.4f "
-    "continuity=%.1fm maneuver_curvature=%.4f maneuver_initial_jerk=%.3f. Starting standalone "
-    "trajectory planner (replanning at %.1f Hz).",
+    "continuity=%.1fm maneuver_curvature=%.4f maneuver_initial_jerk=%.3f "
+    "measured_half_width=%.2fm. Starting standalone trajectory planner (replanning at %.1f Hz).",
     goal->pose.position.x, goal->pose.position.y, goal->score, goal->distance_from_ego,
     goal->curvature, goal->continuity_length, goal->maneuver_curvature,
-    goal->maneuver_initial_jerk, planning_rate_hz_);
+    goal->maneuver_initial_jerk, goal->measured_half_width, planning_rate_hz_);
 
   active_goal_ = goal->pose;
   consecutive_planning_failures_ = 0;

@@ -82,6 +82,41 @@ double GoalScorer::continuityRunLength(const nav_msgs::msg::Path & path, std::si
   return run_length;
 }
 
+double GoalScorer::windowedMinHalfWidth(
+  const nav_msgs::msg::Path & path, const std::vector<float> & half_widths,
+  std::size_t index) const
+{
+  double min_width = static_cast<double>(half_widths[index]);
+
+  // Backward half of the window -- same walk/gap rules as smoothedHeading().
+  double back_span = 0.0;
+  for (std::size_t i = index; i > 0; --i) {
+    const double seg_len = planarDistance(
+      path.poses[i].pose.position, path.poses[i - 1].pose.position);
+    if (seg_len > params_.max_continuity_gap ||
+        back_span + seg_len > params_.width_window_half_length) {
+      break;
+    }
+    back_span += seg_len;
+    min_width = std::min(min_width, static_cast<double>(half_widths[i - 1]));
+  }
+
+  // Forward half of the window.
+  double forward_span = 0.0;
+  for (std::size_t i = index; i + 1 < path.poses.size(); ++i) {
+    const double seg_len = planarDistance(
+      path.poses[i].pose.position, path.poses[i + 1].pose.position);
+    if (seg_len > params_.max_continuity_gap ||
+        forward_span + seg_len > params_.width_window_half_length) {
+      break;
+    }
+    forward_span += seg_len;
+    min_width = std::min(min_width, static_cast<double>(half_widths[i + 1]));
+  }
+
+  return min_width;
+}
+
 geometry_msgs::msg::Quaternion GoalScorer::smoothedHeading(
   const nav_msgs::msg::Path & path, std::size_t index) const
 {
@@ -131,11 +166,22 @@ geometry_msgs::msg::Quaternion GoalScorer::smoothedHeading(
 
 std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
   const nav_msgs::msg::Path & centerline_map, const geometry_msgs::msg::Pose & ego_pose,
-  double ego_speed_mps) const
+  double ego_speed_mps, const std::vector<float> & half_widths) const
 {
   if (centerline_map.poses.empty()) {
     return std::nullopt;
   }
+
+  // Width data is only usable if index-aligned with this exact centerline -- a size
+  // mismatch means the two topics are momentarily out of step (see the halfwidth topic's
+  // docs in shoulder_centerline_node) and per-index lookups would be meaningless.
+  const bool have_width_data =
+    !half_widths.empty() && half_widths.size() == centerline_map.poses.size();
+  if (!have_width_data && params_.require_width_data) {
+    return std::nullopt;  // Fail closed -- see require_width_data's docs.
+  }
+  // Minimum scaled half-width a candidate's window must measure to fit the vehicle.
+  const double required_half_width = params_.vehicle_half_width + params_.goal_width_margin;
 
   const double ego_yaw = yawFromQuaternion(ego_pose.orientation);
   const double ego_forward_x = std::cos(ego_yaw);
@@ -178,6 +224,20 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
     const double continuity_length = continuityRunLength(centerline_map, i);
     if (continuity_length < params_.min_continuity_length) {
       continue;  // Not enough confirmed shoulder ahead of this point yet.
+    }
+
+    // Measured-width gate -- the vehicle's actual footprint (plus margin) must fit within
+    // the measured shoulder over a window the length of the vehicle, not at one point.
+    // Checked before the (much more expensive) spiral solve below. See
+    // vehicle_half_width/width_measurement_scale/width_window_half_length's docs for the
+    // live-verified wedge this prevents and the scale factor's derivation.
+    double scaled_half_width = 0.0;
+    if (have_width_data) {
+      scaled_half_width = params_.width_measurement_scale *
+                          windowedMinHalfWidth(centerline_map, half_widths, i);
+      if (scaled_half_width < required_half_width) {
+        continue;
+      }
     }
 
     // Maneuver feasibility from ego's actual current pose -- see class
@@ -226,11 +286,21 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
       std::clamp(maneuver.peakCurvature() / params_.max_maneuver_curvature, 0.0, 1.0);
     const double jerk_norm =
       std::clamp(std::abs(estimated_initial_jerk) / params_.max_maneuver_jerk, 0.0, 1.0);
+    // Prefer wider shoulder beyond the bare gate (0 at exactly-required width, 1 at
+    // required + reference_extra_half_width) -- see weight_width's docs. Neutral 0 when
+    // width gating is inactive so weights still sum consistently.
+    const double width_norm =
+      have_width_data
+        ? std::clamp(
+            (scaled_half_width - required_half_width) / params_.reference_extra_half_width,
+            0.0, 1.0)
+        : 0.0;
 
     const double score = params_.weight_continuity * continuity_norm +
                           params_.weight_curvature * (1.0 - curvature_norm) +
                           params_.weight_maneuver_ease * (1.0 - maneuver_norm) +
-                          params_.weight_jerk_ease * (1.0 - jerk_norm);
+                          params_.weight_jerk_ease * (1.0 - jerk_norm) +
+                          params_.weight_width * width_norm;
 
     if (!best.has_value() || score > best->score) {
       ScoredCandidate candidate;
@@ -244,6 +314,7 @@ std::optional<ScoredCandidate> GoalScorer::selectBestGoal(
       candidate.continuity_length = continuity_length;
       candidate.maneuver_curvature = maneuver.peakCurvature();
       candidate.maneuver_initial_jerk = estimated_initial_jerk;
+      candidate.measured_half_width = scaled_half_width;
       best = candidate;
     }
   }

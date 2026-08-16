@@ -6,6 +6,7 @@
 #include <nav_msgs/msg/path.hpp>
 
 #include <optional>
+#include <vector>
 
 namespace autoware::shoulder_pullover_manager
 {
@@ -14,13 +15,12 @@ namespace autoware::shoulder_pullover_manager
 ///
 /// This is a deliberately *classical* (point-estimate, no probability)
 /// implementation of the goal-scoring formula from the project's pull-over
-/// MRM framework report. It only uses fields that shoulder_centerline_node
-/// actually publishes today (position + heading per waypoint on
-/// shoulder_centerline_path_map) -- the report's "maturity" and "lateral
-/// clearance" terms are intentionally omitted here rather than faked, since
-/// no topic currently exposes per-point sample-confidence or shoulder width.
-/// Adding those requires extending shoulder_centerline_node's published
-/// interface first; see project memory (pullover_mrm_framework.md).
+/// MRM framework report. The report's "lateral clearance" term, originally
+/// omitted because no topic exposed shoulder width, was added 2026-08-16 (see
+/// vehicle_half_width/goal_width_margin below) once shoulder_centerline_node
+/// began publishing its measured per-point half-width (halfwidth_pub_, added
+/// 2026-08-15). The "maturity" (per-point sample-confidence) term remains
+/// intentionally omitted rather than faked -- still no topic exposes it.
 ///
 /// **Added 2026-08-05: maneuver feasibility from ego's actual current
 /// pose.** The original `curvature` term below only measures the shoulder
@@ -152,6 +152,72 @@ struct GoalScorerParams
   /// check.
   double max_maneuver_jerk{3.0};
 
+  /// --- Measured-shoulder-width gate + preference, added 2026-08-16 ---
+  /// Live-verified root cause (bag `pullover_widthdata_1786901356`, 2026-08-16, plus
+  /// fullfix2/3 the day before): every goal this scorer committed sat on a stretch whose
+  /// *measured* half-width (shoulder_centerline_node's halfwidth topic) was 0.41-1.20m,
+  /// under the ~1.25m the vehicle's own footprint needs -- the vehicle turned onto a
+  /// ~0.8m-wide paved strip and physically wedged against the shoulder-edge barrier at
+  /// 25% throttle for minutes. Width data existed the whole time; only the *arrival*
+  /// containment gate consumed it, never selection. This is the same footprint-in-corridor
+  /// test stock Autoware's goal_planner already runs at goal-search time
+  /// (goal_searcher.cpp: vehicle footprint + margin_from_boundary=0.75 must fit within the
+  /// pull-over lane polygon) -- applied here against the perception-measured corridor
+  /// instead of HD-map lane polygons, since this project's map has no shoulder lanelets at
+  /// all (the founding constraint, see PullOverManagerNode's class docs).
+  ///
+  /// Same value as PullOverManagerNode::vehicle_half_width_ (0.5*wheel_tread +
+  /// max(left_overhang, right_overhang)) -- populated by the owning node from the same
+  /// vehicle_info params, duplicated per this file's existing convention for
+  /// max_maneuver_curvature (independently-testable components, owning node keeps them
+  /// consistent).
+  double vehicle_half_width{0.948};
+  /// m. Extra clearance beyond vehicle_half_width required of the (scaled, windowed)
+  /// measured half-width before a candidate is eligible at all. Same spirit as
+  /// goal_planner's margin_from_boundary (0.75 stock) but smaller: that margin is against
+  /// exact HD-map boundaries, while ours is against a measurement that is already
+  /// conservative by construction (see width_measurement_scale) *and* gated by a windowed
+  /// minimum (see width_window_half_length), both of which under- rather than over-state
+  /// the usable corridor.
+  double goal_width_margin{0.3};
+  /// Multiplier applied to the published half-width before gating. 1.0 (identity) since
+  /// 2026-08-16, when shoulder_centerline_node began measuring half-width *directly* --
+  /// back-projecting the shoulder mask run's own left/right edge pixels to the ground
+  /// plane, the same IPM the centerline position itself uses -- so the published value is
+  /// already the physical half-width and needs no correction.
+  ///
+  /// A 1.25 factor briefly lived here to invert the old trimmed-extent estimator's
+  /// (1-2*trim) bias. That was the wrong fix for the wrong model: live data showed the old
+  /// value wasn't a scaled-down width at all but the midpoint estimator's jitter (a
+  /// near-constant ~0.40m regardless of a shoulder whose CARLA ground truth is 1.75m
+  /// half-width), which no scalar can correct. Kept as a parameter rather than deleted so a
+  /// future sensor/estimator with a known, characterized bias can be corrected here without
+  /// touching the gate logic -- but do not reintroduce a nonzero correction without
+  /// evidence the underlying measurement is genuinely proportional to truth.
+  double width_measurement_scale{1.0};
+  /// m. Half-length of the arclength window, centered on the candidate, over which the
+  /// MINIMUM measured half-width is taken for the gate -- the parked vehicle occupies
+  /// roughly its own length of shoulder, not one centerline point, so a single wide bin
+  /// inside a narrow stretch must not pass (and, symmetrically, via the windowed minimum
+  /// a single dropout bin -- observed live: an isolated 0.01m reading amid 0.4m
+  /// neighbors -- inside a genuinely wide stretch WILL conservatively fail it; that
+  /// costs a candidate, never safety). Default ~half the sample_vehicle's ~4.8m length.
+  double width_window_half_length{2.5};
+  /// Score weight for preferring wider (scaled, windowed-min) shoulder beyond the bare
+  /// gate -- pushes goals toward the deepest/widest part of a pocket rather than its
+  /// marginal entrance, complementing the hard gate the same way weight_maneuver_ease
+  /// complements max_maneuver_curvature.
+  double weight_width{0.3};
+  /// m. Extra half-width (beyond the gate's requirement) at which the width score term
+  /// saturates to 1.0.
+  double reference_extra_half_width{0.5};
+  /// If true (default), candidates are ineligible when no measured width data is
+  /// available at all (empty/mismatched halfwidth array) -- fail closed, consistent with
+  /// PullOverManagerNode::require_shoulder_containment_'s arrival-side behavior. The
+  /// owning node passes an empty vector to selectBestGoal when its subscription has
+  /// nothing usable; set false only for setups intentionally not publishing width.
+  bool require_width_data{true};
+
   /// How far (meters, each direction along the centerline) to look when
   /// computing the candidate goal's *heading* via a length-weighted average
   /// of local tangent segments, instead of trusting that single waypoint's
@@ -196,6 +262,9 @@ struct ScoredCandidate
   double continuity_length{0.0};
   double maneuver_curvature{0.0};  ///< Peak curvature of the ego->candidate CurvatureSpiralPath.
   double maneuver_initial_jerk{0.0};  ///< Estimated initial lateral jerk at ego's current speed.
+  double measured_half_width{0.0};  ///< Scaled, windowed-min half-width (m) the width gate saw
+                                     ///< at this candidate -- 0.0 if width gating was inactive
+                                     ///< (no data + require_width_data false). For logging.
 };
 
 /// Selects the best feasible shoulder pull-over goal from the live,
@@ -212,16 +281,23 @@ public:
   /// Returns the highest-scoring feasible candidate, or std::nullopt if no
   /// waypoint in `centerline_map` satisfies the hard feasibility gates
   /// (ahead of ego, within lookahead range, past the minimum stopping
-  /// distance, with enough confirmed continuity ahead, and -- see class
-  /// docs -- reachable from ego's current pose via a CurvatureSpiralPath
-  /// whose peak curvature stays under max_maneuver_curvature). The last
-  /// gate is checked only for candidates that already pass the cheaper
-  /// ones, since it costs a full Newton solve (occasionally several, if
-  /// the goal-curvature sweep kicks in -- see CurvatureSpiralPath's class
-  /// docs) per candidate.
+  /// distance, with enough confirmed continuity ahead, wide enough for the
+  /// vehicle's actual footprint per the measured width gate -- see
+  /// vehicle_half_width's docs -- and, see class docs, reachable from ego's
+  /// current pose via a CurvatureSpiralPath whose peak curvature stays
+  /// under max_maneuver_curvature). The spiral gate is checked only for
+  /// candidates that already pass the cheaper ones, since it costs a full
+  /// Newton solve (occasionally several, if the goal-curvature sweep kicks
+  /// in -- see CurvatureSpiralPath's class docs) per candidate.
+  ///
+  /// `half_widths` is shoulder_centerline_node's measured half-width array,
+  /// index-aligned with centerline_map.poses (see that node's halfwidth_pub_
+  /// docs). Pass an empty vector when no usable (present, size-matched) data
+  /// exists -- candidates then fail the width gate outright when
+  /// require_width_data is true (the default), or skip it when false.
   [[nodiscard]] std::optional<ScoredCandidate> selectBestGoal(
     const nav_msgs::msg::Path & centerline_map, const geometry_msgs::msg::Pose & ego_pose,
-    double ego_speed_mps) const;
+    double ego_speed_mps, const std::vector<float> & half_widths = {}) const;
 
 private:
   /// Local curvature at `index` via the standard three-point (Menger)
@@ -235,6 +311,16 @@ private:
   /// max_continuity_gap_.
   [[nodiscard]] double continuityRunLength(const nav_msgs::msg::Path & path, std::size_t index)
     const;
+
+  /// Minimum raw measured half-width within width_window_half_length (arclength, each
+  /// direction, stopping at a gap larger than max_continuity_gap -- same walk rule as
+  /// continuityRunLength/smoothedHeading) of `index`. Windowed because the parked
+  /// vehicle occupies its own length of shoulder, not a point -- see
+  /// width_window_half_length's docs. Returns the raw (unscaled) minimum; the caller
+  /// applies width_measurement_scale.
+  [[nodiscard]] double windowedMinHalfWidth(
+    const nav_msgs::msg::Path & path, const std::vector<float> & half_widths,
+    std::size_t index) const;
 
   /// Length-weighted average tangent direction of the centerline segments
   /// within heading_smoothing_distance_ of `index` in either direction
