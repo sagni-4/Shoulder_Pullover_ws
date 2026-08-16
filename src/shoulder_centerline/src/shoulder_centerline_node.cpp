@@ -67,6 +67,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
@@ -88,10 +89,13 @@ struct Waypoint
 
 // Every raw map-frame sample ever observed for one world-frame bin (see the
 // accumulate_path_ comment in the constructor for why this is keyed by
-// traveled arclength rather than a 2D grid cell).
+// traveled arclength rather than a 2D grid cell). `hw` holds per-sample
+// *directly measured* half-widths (mask_ipm mode only, see
+// sampleMaskCenterline) -- may be empty in lidar mode, where width falls
+// back to the extent of the painted-point spread instead.
 struct WorldBinSamples
 {
-  std::vector<double> x, y, z;
+  std::vector<double> x, y, z, hw;
 };
 
 double median(std::vector<double> v)
@@ -128,6 +132,12 @@ double robustExtentMidpoint(std::vector<double> v, double trim_fraction)
   const double high = v[n - 1 - trim];
   return 0.5 * (low + high);
 }
+
+// (robustExtentHalfWidth removed 2026-08-16: it derived a "width" from the trimmed extent of
+// the per-bin midpoint samples, which in the default mask_ipm mode is one sample per image row
+// and therefore measures the midpoint estimator's own jitter rather than the shoulder -- see
+// lateralHalfWidth() for the live evidence and the direct edge-pixel measurement that replaced
+// it.)
 
 }  // namespace
 
@@ -173,6 +183,11 @@ public:
     centerline_estimator_ = declare_parameter<std::string>("centerline_estimator", "extent_midpoint");
     use_extent_midpoint_ = (centerline_estimator_ == "extent_midpoint");
     edge_trim_fraction_ = declare_parameter<double>("edge_trim_fraction", 0.1);
+    // Used by lateralHalfWidth() only when centerline_estimator=="median" (no measured extent
+    // available in that mode) -- deliberately conservative (narrower than almost any real
+    // paved shoulder) so a downstream containment check errs toward treating width as
+    // unconfirmed rather than silently passing on a made-up generous number.
+    half_width_fallback_ = declare_parameter<double>("half_width_fallback", 0.5);
 
     // Where the lateral sample for each bin comes from in the first place.
     // "lidar": project LiDAR points into the mask, keep the ones landing on
@@ -266,6 +281,12 @@ public:
 
     path_pub_ = create_publisher<Path>(path_topic_, 1);
     accumulated_path_pub_ = create_publisher<Path>(accumulated_path_topic_, 1);
+    // Index-aligned with accumulated_path_pub_'s poses (data[i] is the half-width, meters,
+    // measured at poses[i]) -- a plain parallel array rather than a custom message so no new
+    // .msg definition/dependency is needed anywhere downstream. See lateralHalfWidth()'s docs
+    // for what "measured" means here and its median-estimator fallback caveat.
+    halfwidth_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(
+      accumulated_path_topic_ + "_halfwidth", 1);
     debug_pub_ = create_publisher<Image>(debug_image_topic_, 1);
 
     image_sub_.subscribe(this, image_topic_, rmw_qos_profile_default);
@@ -301,19 +322,75 @@ private:
     return use_extent_midpoint_ ? robustExtentMidpoint(y, edge_trim_fraction_) : median(y);
   }
 
+  /// Half-width (m) published for a bin, from `hw` -- the per-sample *directly measured*
+  /// half-widths back-projected from the mask run's own edge pixels (see
+  /// sampleMaskCenterline). The median across every sample ever collected for the bin, the
+  /// same robust aggregation used for the bin's position, so a few bad rows can't move it.
+  ///
+  /// Rewritten 2026-08-16 (live-verified bug): this used to return
+  /// robustExtentHalfWidth(bin_y) -- the trimmed lateral *extent of the midpoint samples*.
+  /// In mask_ipm mode (the default) each image row contributes exactly ONE midpoint, so
+  /// that quantity measures the midpoint estimator's own frame-to-frame jitter, NOT the
+  /// shoulder's width: it read a near-constant ~0.40m along an entire 116-point trail on a
+  /// shoulder whose CARLA ground-truth lane_width is 3.50m (true half-width 1.75m), and
+  /// that bogus value is what made the downstream pull-over width gate reject every goal on
+  /// the map. Falls back to half_width_fallback_ only when there is genuinely nothing
+  /// measured (lidar mode, which produces no per-sample width), so callers can still tell
+  /// measured from assumed.
+  double lateralHalfWidth(const std::vector<double> & hw) const
+  {
+    if (hw.empty()) {
+      return half_width_fallback_;
+    }
+    return median(hw);
+  }
+
+  /// One mask_ipm sample: the run-midpoint ground point plus the run's *directly
+  /// measured* ground-frame half-width -- see sampleMaskCenterline's docs.
+  struct MaskSample
+  {
+    double x, y, half_width;
+  };
+
   // For each sampled image row, finds the largest contiguous run of
   // shoulder-classified columns (robust to disjoint false-positive noise
   // elsewhere in the row -- a global min/max column would wrongly span
-  // across two unrelated detections), takes its midpoint column, and
-  // back-projects that single pixel to base_link via ground-plane (z=0)
-  // inverse perspective mapping. Returns (x, y) points in base_link/
-  // output_frame, ground assumption z=0.
-  std::vector<Eigen::Vector2d> sampleMaskCenterline(
+  // across two unrelated detections), and back-projects to base_link via
+  // ground-plane (z=0) inverse perspective mapping. Returns, per row, the
+  // run's midpoint ground point AND its measured ground-frame half-width
+  // (half the distance between the run's two back-projected edge pixels).
+  //
+  // The half-width measurement was added 2026-08-16, live-verified fix: the
+  // downstream halfwidth topic used to be derived from the lateral *spread of
+  // the midpoint samples themselves* (robustExtentHalfWidth over bin_y) --
+  // but in this mode every row contributes exactly one midpoint, so that
+  // spread measures only the midpoint estimate's own jitter (~0.4m observed),
+  // not the shoulder's extent. Live-confirmed against CARLA ground truth
+  // (Town04 shoulder lane_width=3.50m -> true half-width 1.75m) vs a
+  // uniformly ~0.40m "measured" value across an entire 116-point trail.
+  // Back-projecting the run's actual edge pixels measures the real thing the
+  // same way the midpoint itself is measured -- no statistical proxy.
+  std::vector<MaskSample> sampleMaskCenterline(
     const cv::Mat & mask, const Eigen::Isometry3d & t_base_cam, double fx, double fy, double cx, double cy) const
   {
-    std::vector<Eigen::Vector2d> samples;
+    std::vector<MaskSample> samples;
     const Eigen::Matrix3d r_base_cam = t_base_cam.rotation();
     const Eigen::Vector3d c_base = t_base_cam.translation();
+
+    // Ground-plane (base_link z=0) intersection of the camera ray through
+    // pixel (col, row); nullopt when the ray misses the ground ahead.
+    const auto projectPixel = [&](double col, double row) -> std::optional<Eigen::Vector3d> {
+      const Eigen::Vector3d d_cam((col - cx) / fx, (row - cy) / fy, 1.0);
+      const Eigen::Vector3d d_base = r_base_cam * d_cam;
+      if (d_base.z() >= -1e-6) {
+        return std::nullopt;  // parallel to or above the ground plane -- no intersection ahead
+      }
+      const double t = -c_base.z() / d_base.z();
+      if (t <= 0.0) {
+        return std::nullopt;  // intersection behind the camera
+      }
+      return c_base + t * d_base;
+    };
 
     for (int row = 0; row < mask.rows; row += mask_row_step_) {
       const uint8_t * row_ptr = mask.ptr<uint8_t>(row);
@@ -338,20 +415,25 @@ private:
       }
       const double center_col = best_start + 0.5 * (best_len - 1);
 
-      const Eigen::Vector3d d_cam((center_col - cx) / fx, (row - cy) / fy, 1.0);
-      const Eigen::Vector3d d_base = r_base_cam * d_cam;
-      if (d_base.z() >= -1e-6) {
-        continue;  // ray parallel to or pointing above the ground plane -- no valid intersection ahead
-      }
-      const double t = -c_base.z() / d_base.z();
-      if (t <= 0.0) {
-        continue;  // intersection behind the camera
-      }
-      const Eigen::Vector3d p = c_base + t * d_base;
-      if (p.x() < x_min_ || p.x() > x_max_) {
+      const auto p = projectPixel(center_col, row);
+      if (!p || p->x() < x_min_ || p->x() > x_max_) {
         continue;
       }
-      samples.emplace_back(p.x(), p.y());
+
+      // Measured half-width: back-project the run's two edge pixels and take
+      // half their planar ground distance. Falls back to 0.0 (meaning "no
+      // measurement this row", filtered out by the median downstream only if
+      // every sample fails, which the center-projection success above makes
+      // effectively impossible) if either edge ray somehow misses the ground.
+      double half_width = 0.0;
+      const auto p_left = projectPixel(static_cast<double>(best_start), row);
+      const auto p_right = projectPixel(static_cast<double>(best_start + best_len - 1), row);
+      if (p_left && p_right) {
+        half_width =
+          0.5 * std::hypot(p_right->x() - p_left->x(), p_right->y() - p_left->y());
+      }
+
+      samples.push_back({p->x(), p->y(), half_width});
     }
     return samples;
   }
@@ -409,7 +491,7 @@ private:
     const double cx = camera_info->k[2], cy = camera_info->k[5];
 
     const int num_bins = static_cast<int>(std::ceil((x_max_ - x_min_) / bin_size_));
-    std::vector<std::vector<double>> bin_y(num_bins), bin_z(num_bins);
+    std::vector<std::vector<double>> bin_y(num_bins), bin_z(num_bins), bin_hw(num_bins);
     std::vector<cv::Point> painted_px;
 
     std::size_t total_points = 0, in_bounds_points = 0, painted_points = 0, banded_points = 0;
@@ -482,19 +564,21 @@ private:
       if (const auto t_base_cam_msg = lookup(output_frame_, cam_frame)) {
         const Eigen::Isometry3d t_base_cam = tf2::transformToEigen(*t_base_cam_msg);
         for (const auto & s : sampleMaskCenterline(mask, t_base_cam, fx, fy, cx, cy)) {
-          const int b = static_cast<int>((s.x() - x_min_) / bin_size_);
+          const int b = static_cast<int>((s.x - x_min_) / bin_size_);
           if (b >= 0 && b < num_bins) {
-            bin_y[b].push_back(s.y());
+            bin_y[b].push_back(s.y);
             bin_z[b].push_back(0.0);
+            bin_hw[b].push_back(s.half_width);
           }
-          if (t_map_base && s.x() >= world_min_capture_x_) {
-            const Eigen::Vector3d p_map = *t_map_base * Eigen::Vector3d(s.x(), s.y(), 0.0);
+          if (t_map_base && s.x >= world_min_capture_x_) {
+            const Eigen::Vector3d p_map = *t_map_base * Eigen::Vector3d(s.x, s.y, 0.0);
             const long long world_key =
-              static_cast<long long>(std::floor((traveled_arclength_ + s.x()) / bin_size_));
+              static_cast<long long>(std::floor((traveled_arclength_ + s.x) / bin_size_));
             auto & wb = world_bins_[world_key];
             wb.x.push_back(p_map.x());
             wb.y.push_back(p_map.y());
             wb.z.push_back(p_map.z());
+            wb.hw.push_back(s.half_width);
           }
         }
       }
@@ -664,12 +748,15 @@ private:
     path.header.stamp = stamp;
 
     std::vector<Eigen::Vector3d> points;
+    std::vector<float> half_widths;
     points.reserve(world_bins_.size());
+    half_widths.reserve(world_bins_.size());
     for (const auto & [key, wb] : world_bins_) {
       if (static_cast<int>(wb.x.size()) < min_world_bin_samples_) {
         continue;
       }
       points.emplace_back(median(wb.x), lateralCenter(wb.y), median(wb.z));
+      half_widths.push_back(static_cast<float>(lateralHalfWidth(wb.hw)));
     }
 
     path.poses.reserve(points.size());
@@ -690,6 +777,12 @@ private:
       path.poses.push_back(pose);
     }
     accumulated_path_pub_->publish(path);
+
+    // Published index-aligned with path.poses above (same loop, same world_bins_ iteration
+    // order) -- see halfwidth_pub_'s docs.
+    std_msgs::msg::Float32MultiArray halfwidth_msg;
+    halfwidth_msg.data = std::move(half_widths);
+    halfwidth_pub_->publish(halfwidth_msg);
   }
 
   void publishDebugImage(
@@ -751,6 +844,7 @@ private:
   std::string centerline_estimator_;
   bool use_extent_midpoint_;
   double edge_trim_fraction_;
+  double half_width_fallback_;
   bool use_mask_center_ipm_;
   int mask_row_step_;
   int min_mask_run_px_;
@@ -774,6 +868,7 @@ private:
 
   rclcpp::Publisher<Path>::SharedPtr path_pub_;
   rclcpp::Publisher<Path>::SharedPtr accumulated_path_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr halfwidth_pub_;
   rclcpp::Publisher<Image>::SharedPtr debug_pub_;
 
   message_filters::Subscriber<Image> image_sub_, mask_sub_;
